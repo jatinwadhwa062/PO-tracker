@@ -1,29 +1,33 @@
 """
-app.py — Brillare PO Delivery Tracker (shared, multi-user, logged)
+app.py — Brillare PO Delivery Tracker (real per-user accounts)
 --------------------------------------------------------------------------------
-LOGIN: a dedicated login page - enter your name + password. The password
-determines your role:
-    admin_password  -> full access: upload data, Mark Delayed/On Time,
-                        Mark Received, Bin/Restore, see the Activity Log
-    viewer_password -> can see everything and Mark Delayed/On Time, but
-                        CANNOT Mark Received or Bin - those are admin-only
-If neither secret is set, everyone gets admin access (no login required) -
-same as the very first version, for a clean local test run.
+AUTHENTICATION: real username + password per person, not a shared password.
+Passwords are hashed (PBKDF2-HMAC-SHA256, 100,000 iterations, random salt
+per user) - never stored in plain text anywhere.
 
-ACTIVITY LOG: every login and every action (mark delayed, mark received,
-bin, restore, upload, date/reason changes) is recorded with who did it and
-when. Only the admin can see the log - it's a new tab that simply doesn't
-exist for anyone else.
+FIRST-TIME SETUP: with no users yet, the app shows a one-time Setup screen
+gated by a `setup_password` secret (set this in Streamlit Secrets - only
+you should know it). Use it once to create your own admin account. After
+that, the Setup screen never appears again - it's a normal login, and you
+manage further accounts from the "Manage Users" tab inside the app.
 
-SHARED FILES on the server (not browser memory):
-    shared_data/tracker.xlsx     - the uploaded PO_Delivery_Tracker_Final.xlsx
-    shared_data/state.json       - every row's status/received/binned/date/reason
+ROLES:
+    admin  -> upload data, Mark Delayed/On Time, Mark Received, Bin/Restore,
+              see the Activity Log, manage user accounts
+    editor -> can see everything and Mark Delayed/On Time, cannot Mark
+              Received or Bin, no access to Activity Log or Manage Users
+
+SHARED FILES on the server:
+    shared_data/users.json        - username -> {salt, hash, role}
+    shared_data/tracker.xlsx      - the uploaded PO_Delivery_Tracker_Final.xlsx
+    shared_data/state.json        - every row's status/received/binned/date/reason
     shared_data/activity_log.json - append-only log of every action
 """
 
 import io
 import os
 import json
+import hashlib
 import datetime as dt
 import streamlit as st
 import pandas as pd
@@ -31,6 +35,7 @@ import pandas as pd
 st.set_page_config(page_title="PO Delivery Tracker", layout="wide")
 
 SHARED_DIR = "shared_data"
+USERS_PATH = os.path.join(SHARED_DIR, "users.json")
 SHARED_XLSX_PATH = os.path.join(SHARED_DIR, "tracker.xlsx")
 SHARED_STATE_PATH = os.path.join(SHARED_DIR, "state.json")
 ACTIVITY_LOG_PATH = os.path.join(SHARED_DIR, "activity_log.json")
@@ -48,7 +53,7 @@ STOCK_BADGE = {
 
 
 # ---------------------------------------------------------------------------
-# SHARED STATE HELPERS
+# JSON FILE HELPERS
 # ---------------------------------------------------------------------------
 def load_json(path, default):
     if os.path.exists(path):
@@ -65,39 +70,35 @@ def save_json(path, data):
         json.dump(data, f)
 
 
-def load_shared_state():
-    return load_json(SHARED_STATE_PATH, {})
+# ---------------------------------------------------------------------------
+# PASSWORD HASHING - PBKDF2-HMAC-SHA256, random salt per user, no plaintext
+# ---------------------------------------------------------------------------
+def hash_password(password, salt_hex):
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), 100_000).hex()
 
 
-def save_shared_state(state):
-    save_json(SHARED_STATE_PATH, state)
+def create_user(users, username, password, role):
+    salt = os.urandom(16).hex()
+    users[username.lower().strip()] = {"salt": salt, "hash": hash_password(password, salt), "role": role}
+    return users
 
 
-def row_default(rid, state, pipeline_delayed):
-    return state.setdefault(rid, {
-        "status": "Delayed" if pipeline_delayed else "On Time",
-        "received": False,
-        "binned": False,
-        "revised_date": None,
-        "reason": None,
-    })
+def verify_user(users, username, password):
+    u = users.get(username.lower().strip())
+    if not u:
+        return None
+    if hash_password(password, u["salt"]) == u["hash"]:
+        return u["role"]
+    return None
 
 
 def log_action(action):
-    user = st.session_state.get("user_name", "Unknown")
+    user = st.session_state.get("username", "Unknown")
     log = load_json(ACTIVITY_LOG_PATH, [])
-    log.append({
-        "time": dt.datetime.now().strftime("%d %b %Y, %I:%M %p"),
-        "user": user,
-        "action": action,
-    })
-    log = log[-1000:]  # cap growth
-    save_json(ACTIVITY_LOG_PATH, log)
+    log.append({"time": dt.datetime.now().strftime("%d %b %Y, %I:%M %p"), "user": user, "action": action})
+    save_json(ACTIVITY_LOG_PATH, log[-1000:])
 
 
-# ---------------------------------------------------------------------------
-# LOGIN PAGE
-# ---------------------------------------------------------------------------
 def get_secret(name):
     try:
         return st.secrets.get(name)
@@ -105,54 +106,66 @@ def get_secret(name):
         return None
 
 
-def login_page():
-    admin_pw = get_secret("admin_password")
-    viewer_pw = get_secret("viewer_password")
-    legacy_pw = get_secret("app_password")
+# ---------------------------------------------------------------------------
+# LOGIN / FIRST-TIME SETUP
+# ---------------------------------------------------------------------------
+def auth_gate():
+    users = load_json(USERS_PATH, {})
 
-    if not admin_pw and not viewer_pw and not legacy_pw:
-        st.session_state["role"] = "admin"
-        st.session_state["user_name"] = "Local User"
+    if st.session_state.get("username"):
         return True
 
-    if st.session_state.get("role"):
-        return True
-
-    st.markdown("<br><br>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 1.2, 1])
     with c2:
+        st.markdown("<br>", unsafe_allow_html=True)
         st.title("📦 PO Delivery Tracker")
+
+        if not users:
+            # ---- FIRST-TIME SETUP: create the first (admin) account ----
+            st.subheader("First-time Setup")
+            st.caption("No accounts exist yet. Create the first admin account to get started.")
+            setup_pw_secret = get_secret("setup_password")
+            setup_pw = st.text_input("Setup Password", type="password",
+                                      help="Set this in Streamlit Secrets as setup_password")
+            new_username = st.text_input("Choose a Username")
+            new_password = st.text_input("Choose a Password", type="password")
+            if st.button("Create Admin Account", use_container_width=True):
+                if not setup_pw_secret:
+                    st.error("No setup_password configured in Secrets - add one before continuing.")
+                elif setup_pw != setup_pw_secret:
+                    st.error("Wrong setup password.")
+                elif not new_username.strip() or not new_password:
+                    st.error("Enter a username and password.")
+                else:
+                    create_user(users, new_username, new_password, "admin")
+                    save_json(USERS_PATH, users)
+                    st.session_state["username"] = new_username.strip()
+                    st.session_state["role"] = "admin"
+                    log_action("Created first admin account and logged in")
+                    st.rerun()
+            return False
+
+        # ---- NORMAL LOGIN ----
         st.subheader("Login")
-        name = st.text_input("Your Name")
-        pw = st.text_input("Password", type="password")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
         if st.button("Login", use_container_width=True):
-            if not name.strip():
-                st.error("Please enter your name.")
-            elif admin_pw and pw == admin_pw:
-                st.session_state["role"] = "admin"
-                st.session_state["user_name"] = name.strip()
-                log_action("Logged in (admin)")
-                st.rerun()
-            elif legacy_pw and pw == legacy_pw:
-                st.session_state["role"] = "admin"
-                st.session_state["user_name"] = name.strip()
-                log_action("Logged in (admin)")
-                st.rerun()
-            elif viewer_pw and pw == viewer_pw:
-                st.session_state["role"] = "editor"
-                st.session_state["user_name"] = name.strip()
-                log_action("Logged in (editor)")
+            role = verify_user(users, username, password)
+            if role:
+                st.session_state["username"] = username.strip()
+                st.session_state["role"] = role
+                log_action(f"Logged in ({role})")
                 st.rerun()
             else:
-                st.error("Wrong password.")
+                st.error("Wrong username or password.")
     return False
 
 
-if not login_page():
+if not auth_gate():
     st.stop()
 
 is_admin = st.session_state["role"] == "admin"
-current_user = st.session_state["user_name"]
+current_user = st.session_state["username"]
 
 
 def badge(text, bg, fg):
@@ -173,11 +186,20 @@ def fmt_num(n):
 
 
 # ---------------------------------------------------------------------------
+# HEADER / LOGOUT
+# ---------------------------------------------------------------------------
+hcol1, hcol2 = st.columns([5, 1])
+hcol1.title("📦 PO Delivery Tracker")
+hcol1.caption(f"Logged in as **{current_user}** ({'Admin' if is_admin else 'Editor'})")
+if hcol2.button("Log out"):
+    log_action("Logged out")
+    st.session_state.pop("username", None)
+    st.session_state.pop("role", None)
+    st.rerun()
+
+# ---------------------------------------------------------------------------
 # LOAD / UPLOAD DATA
 # ---------------------------------------------------------------------------
-st.title("📦 PO Delivery Tracker")
-st.caption(f"Logged in as **{current_user}** ({'Admin' if is_admin else 'Editor'})")
-
 if is_admin:
     uploaded = st.file_uploader("Upload PO_Delivery_Tracker_Final.xlsx to update everyone's view", type=["xlsx"])
     if uploaded is not None:
@@ -214,10 +236,18 @@ po_master["_rid"] = (
     po_master["Item Code"].astype(str)
 )
 
-shared_state = load_shared_state()
+
+def row_default(rid, state, pipeline_delayed):
+    return state.setdefault(rid, {
+        "status": "Delayed" if pipeline_delayed else "On Time",
+        "received": False, "binned": False, "revised_date": None, "reason": None,
+    })
+
+
+shared_state = load_json(SHARED_STATE_PATH, {})
 for _, row in po_master.iterrows():
     row_default(row["_rid"], shared_state, row.get("Delivery Status") == "Delayed")
-save_shared_state(shared_state)
+save_json(SHARED_STATE_PATH, shared_state)
 
 # ---------------------------------------------------------------------------
 # VENDOR + SKU SEARCH FILTER BAR
@@ -271,8 +301,6 @@ def render_row(row, show_delay_controls):
             unsafe_allow_html=True,
         )
 
-        # Editors only get the status toggle (+ date/reason if Delayed).
-        # Received and Bin are admin-only.
         n_buttons = 1 + (2 if is_admin else 0)
         widths = ([1] * n_buttons) + ([1.3, 1.5] if show_delay_controls else [])
         cols = st.columns(widths)
@@ -281,13 +309,13 @@ def render_row(row, show_delay_controls):
         if rstate["status"] == "On Time":
             if cols[ci].button("🔴 Mark Delayed", key=f"toggle_{rid}"):
                 shared_state[rid]["status"] = "Delayed"
-                save_shared_state(shared_state)
+                save_json(SHARED_STATE_PATH, shared_state)
                 log_action(f"Marked {po_no} / {item_code} as Delayed")
                 st.rerun()
         else:
             if cols[ci].button("🟢 Mark On Time", key=f"toggle_{rid}"):
                 shared_state[rid]["status"] = "On Time"
-                save_shared_state(shared_state)
+                save_json(SHARED_STATE_PATH, shared_state)
                 log_action(f"Marked {po_no} / {item_code} as On Time")
                 st.rerun()
         ci += 1
@@ -296,14 +324,14 @@ def render_row(row, show_delay_controls):
             recv_label = "✅ Received" if rstate["received"] else "📥 Mark Received"
             if cols[ci].button(recv_label, key=f"recv_{rid}"):
                 shared_state[rid]["received"] = not rstate["received"]
-                save_shared_state(shared_state)
+                save_json(SHARED_STATE_PATH, shared_state)
                 log_action(f"{'Marked' if not rstate['received'] else 'Unmarked'} {po_no} / {item_code} as Received")
                 st.rerun()
             ci += 1
 
             if cols[ci].button("🗑️ Bin", key=f"bin_{rid}"):
                 shared_state[rid]["binned"] = True
-                save_shared_state(shared_state)
+                save_json(SHARED_STATE_PATH, shared_state)
                 log_action(f"Binned {po_no} / {item_code}")
                 st.rerun()
             ci += 1
@@ -314,7 +342,7 @@ def render_row(row, show_delay_controls):
                                             label_visibility="collapsed")
             if new_date != existing_date:
                 shared_state[rid]["revised_date"] = new_date.isoformat() if new_date else None
-                save_shared_state(shared_state)
+                save_json(SHARED_STATE_PATH, shared_state)
                 log_action(f"Set revised date for {po_no} / {item_code} to {new_date}")
             ci += 1
 
@@ -323,7 +351,7 @@ def render_row(row, show_delay_controls):
                                              placeholder="Reason", label_visibility="collapsed")
             if new_reason != rstate["reason"]:
                 shared_state[rid]["reason"] = new_reason
-                save_shared_state(shared_state)
+                save_json(SHARED_STATE_PATH, shared_state)
                 log_action(f"Set delay reason for {po_no} / {item_code} to {new_reason}")
 
             if not shared_state[rid]["revised_date"]:
@@ -343,7 +371,7 @@ if is_admin:
     tab_labels += [f"🗑️ Bin ({len(binned_rows)})"]
 tab_labels += ["📊 Stressed & Watch SKUs"]
 if is_admin:
-    tab_labels += ["📜 Activity Log"]
+    tab_labels += ["📜 Activity Log", "👥 Manage Users"]
 
 tabs = st.tabs(tab_labels)
 t_ontime, t_delayed = tabs[0], tabs[1]
@@ -352,7 +380,8 @@ if is_admin:
     t_bin = tabs[idx]; idx += 1
 t_stock = tabs[idx]; idx += 1
 if is_admin:
-    t_log = tabs[idx]
+    t_log = tabs[idx]; idx += 1
+    t_users = tabs[idx]
 
 with t_ontime:
     if len(on_time_rows) == 0:
@@ -372,8 +401,7 @@ with t_delayed:
         rstate = shared_state[row["_rid"]]
         if rstate["revised_date"]:
             export_rows.append({
-                "Purchase Order": row["Purchase Order"],
-                "Item Code": row["Item Code"],
+                "Purchase Order": row["Purchase Order"], "Item Code": row["Item Code"],
                 "Revised Expected Delivery Date": rstate["revised_date"],
                 "Delay Reason": rstate["reason"] or "Others",
             })
@@ -401,7 +429,7 @@ if is_admin:
                 st.markdown(f'**{row["Purchase Order"]}** — {row["Item Code"]} · {row.get("SKU Name", "")}')
                 if st.button("♻️ Restore", key=f"restore_{rid}"):
                     shared_state[rid]["binned"] = False
-                    save_shared_state(shared_state)
+                    save_json(SHARED_STATE_PATH, shared_state)
                     log_action(f"Restored {row['Purchase Order']} / {row['Item Code']} from Bin")
                     st.rerun()
 
@@ -445,5 +473,49 @@ if is_admin:
         if not log_entries:
             st.info("No activity yet.")
         else:
-            log_df = pd.DataFrame(log_entries[::-1])  # most recent first
+            log_df = pd.DataFrame(log_entries[::-1])
             st.dataframe(log_df, use_container_width=True, hide_index=True)
+
+    with t_users:
+        st.subheader("Manage Users")
+        users = load_json(USERS_PATH, {})
+
+        st.write("**Existing accounts:**")
+        if users:
+            user_rows = [{"Username": u, "Role": info["role"]} for u, info in users.items()]
+            st.dataframe(pd.DataFrame(user_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No accounts yet.")
+
+        st.divider()
+        st.write("**Add a new account:**")
+        ucol1, ucol2, ucol3, ucol4 = st.columns([1.3, 1.3, 1, 0.8])
+        new_u = ucol1.text_input("Username", key="newuser_name")
+        new_p = ucol2.text_input("Password", type="password", key="newuser_pw")
+        new_role = ucol3.selectbox("Role", ["editor", "admin"], key="newuser_role")
+        if ucol4.button("Add", use_container_width=True):
+            if not new_u.strip() or not new_p:
+                st.error("Enter both a username and password.")
+            elif new_u.lower().strip() in users:
+                st.error("That username already exists.")
+            else:
+                create_user(users, new_u, new_p, new_role)
+                save_json(USERS_PATH, users)
+                log_action(f"Created account for '{new_u.strip()}' ({new_role})")
+                st.success(f"Account created for {new_u.strip()}.")
+                st.rerun()
+
+        st.divider()
+        st.write("**Remove an account:**")
+        removable = [u for u in users if u != current_user.lower()]
+        if removable:
+            rcol1, rcol2 = st.columns([2, 1])
+            to_remove = rcol1.selectbox("Username", removable, key="remove_user_select")
+            if rcol2.button("Remove", use_container_width=True):
+                del users[to_remove]
+                save_json(USERS_PATH, users)
+                log_action(f"Removed account '{to_remove}'")
+                st.success(f"Removed {to_remove}.")
+                st.rerun()
+        else:
+            st.caption("No other accounts to remove.")
