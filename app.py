@@ -29,6 +29,7 @@ import os
 import json
 import hashlib
 import datetime as dt
+from zoneinfo import ZoneInfo
 import streamlit as st
 import pandas as pd
 
@@ -41,6 +42,7 @@ SHARED_STATE_PATH = os.path.join(SHARED_DIR, "state.json")
 ACTIVITY_LOG_PATH = os.path.join(SHARED_DIR, "activity_log.json")
 os.makedirs(SHARED_DIR, exist_ok=True)
 
+IST = ZoneInfo("Asia/Kolkata")
 REASON_OPTIONS = ["RM Connectivity", "PM Connectivity", "Others"]
 
 STOCK_BADGE = {
@@ -95,7 +97,7 @@ def verify_user(users, username, password):
 def log_action(action):
     user = st.session_state.get("username", "Unknown")
     log = load_json(ACTIVITY_LOG_PATH, [])
-    log.append({"time": dt.datetime.now().strftime("%d %b %Y, %I:%M %p"), "user": user, "action": action})
+    log.append({"time": dt.datetime.now(IST).strftime("%d %b %Y, %I:%M %p"), "user": user, "action": action})
     save_json(ACTIVITY_LOG_PATH, log[-1000:])
 
 
@@ -165,6 +167,7 @@ if not auth_gate():
     st.stop()
 
 is_admin = st.session_state["role"] == "admin"
+can_edit = st.session_state["role"] in ("admin", "editor")  # viewer = neither
 current_user = st.session_state["username"]
 
 
@@ -212,7 +215,7 @@ if not os.path.exists(SHARED_XLSX_PATH):
     st.info("No data uploaded yet." if is_admin else "No data uploaded yet - ask your admin to upload today's file.")
     st.stop()
 
-mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(SHARED_XLSX_PATH))
+mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(SHARED_XLSX_PATH), tz="UTC").tz_convert(IST)
 st.caption(f"Showing data uploaded: {mtime.strftime('%d %b %Y, %I:%M %p')}")
 
 try:
@@ -300,6 +303,14 @@ def render_row(row, show_delay_controls):
             f'Required By: **{fmt_date(row["Required By"])}**',
             unsafe_allow_html=True,
         )
+
+        if not can_edit:
+            # Viewer: read-only, zero buttons/widgets - just show current status as text
+            if show_delay_controls:
+                rd = rstate["revised_date"]
+                rd_text = pd.to_datetime(rd).strftime("%d %b %Y") if rd else "not set yet"
+                st.caption(f"Revised Delivery Date: **{rd_text}** &nbsp;·&nbsp; Reason: **{rstate['reason'] or '-'}**")
+            return
 
         n_buttons = 1 + (2 if is_admin else 0)
         widths = ([1] * n_buttons) + ([1.3, 1.5] if show_delay_controls else [])
@@ -395,29 +406,30 @@ with t_delayed:
     for _, row in delayed_rows.iterrows():
         render_row(row, show_delay_controls=True)
 
-    st.divider()
-    export_rows = []
-    for _, row in delayed_rows.iterrows():
-        rstate = shared_state[row["_rid"]]
-        if rstate["revised_date"]:
-            export_rows.append({
-                "Purchase Order": row["Purchase Order"], "Item Code": row["Item Code"],
-                "Revised Expected Delivery Date": rstate["revised_date"],
-                "Delay Reason": rstate["reason"] or "Others",
-            })
-    if export_rows:
-        export_df = pd.DataFrame(export_rows)
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            export_df.to_excel(writer, sheet_name="Delay Tracker", index=False)
-        st.download_button(
-            f"⬇️ Download Delay_Tracker.xlsx ({len(export_df)} line{'s' if len(export_df) != 1 else ''})",
-            data=buf.getvalue(), file_name="Delay_Tracker.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.caption("Drop this into your 3P Tracker folder before the next run_stock_tracker.py run.")
-    else:
-        st.info("Pick a date on at least one Delayed line to enable the download.")
+    if can_edit:
+        st.divider()
+        export_rows = []
+        for _, row in delayed_rows.iterrows():
+            rstate = shared_state[row["_rid"]]
+            if rstate["revised_date"]:
+                export_rows.append({
+                    "Purchase Order": row["Purchase Order"], "Item Code": row["Item Code"],
+                    "Revised Expected Delivery Date": rstate["revised_date"],
+                    "Delay Reason": rstate["reason"] or "Others",
+                })
+        if export_rows:
+            export_df = pd.DataFrame(export_rows)
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                export_df.to_excel(writer, sheet_name="Delay Tracker", index=False)
+            st.download_button(
+                f"⬇️ Download Delay_Tracker.xlsx ({len(export_df)} line{'s' if len(export_df) != 1 else ''})",
+                data=buf.getvalue(), file_name="Delay_Tracker.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.caption("Drop this into your 3P Tracker folder before the next run_stock_tracker.py run.")
+        else:
+            st.info("Pick a date on at least one Delayed line to enable the download.")
 
 if is_admin:
     with t_bin:
@@ -492,7 +504,7 @@ if is_admin:
         ucol1, ucol2, ucol3, ucol4 = st.columns([1.3, 1.3, 1, 0.8])
         new_u = ucol1.text_input("Username", key="newuser_name")
         new_p = ucol2.text_input("Password", type="password", key="newuser_pw")
-        new_role = ucol3.selectbox("Role", ["editor", "admin"], key="newuser_role")
+        new_role = ucol3.selectbox("Role", ["viewer", "editor", "admin"], key="newuser_role")
         if ucol4.button("Add", use_container_width=True):
             if not new_u.strip() or not new_p:
                 st.error("Enter both a username and password.")
