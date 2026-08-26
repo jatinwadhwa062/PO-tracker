@@ -1,36 +1,30 @@
 """
-app.py — Brillare PO Delivery Tracker (shared, multi-user)
+app.py — Brillare PO Delivery Tracker (shared, multi-user, logged)
 --------------------------------------------------------------------------------
-Everyone who opens this app's URL sees the SAME data and the SAME marks
-(Delayed/Received/Bin) - not separate per-browser copies. This works by
-writing to two small files on the server instead of keeping everything in
-browser memory:
-    shared_data/tracker.xlsx    - the uploaded PO_Delivery_Tracker_Final.xlsx
-    shared_data/state.json      - every row's On Time/Delayed/Received/Bin/
-                                   revised date/reason, keyed by row ID
+LOGIN: a dedicated login page - enter your name + password. The password
+determines your role:
+    admin_password  -> full access: upload data, Mark Delayed/On Time,
+                        Mark Received, Bin/Restore, see the Activity Log
+    viewer_password -> can see everything and Mark Delayed/On Time, but
+                        CANNOT Mark Received or Bin - those are admin-only
+If neither secret is set, everyone gets admin access (no login required) -
+same as the very first version, for a clean local test run.
 
-TWO ACCESS LEVELS (set in the app's Secrets on Streamlit Cloud):
-    admin_password  = "..."   -> can upload/replace the master data file,
-                                  AND mark Delayed/Received/Bin
-    viewer_password = "..."   -> can only mark Delayed/Received/Bin,
-                                  cannot replace the master data file
-If only admin_password is set (or neither), everyone gets full access -
-same as before, for backward compatibility.
+ACTIVITY LOG: every login and every action (mark delayed, mark received,
+bin, restore, upload, date/reason changes) is recorded with who did it and
+when. Only the admin can see the log - it's a new tab that simply doesn't
+exist for anyone else.
 
-LIMITATIONS (be aware of these):
-  - Streamlit Cloud's disk is not permanent - if the app restarts (redeploy,
-    long idle period, etc.) shared_data/ is wiped and you'll need to
-    re-upload once. Your Delay/Received/Bin marks would reset too.
-  - Two people editing the exact same row at the exact same second could
-    overwrite each other (last save wins). Fine for a small team, not built
-    for heavy simultaneous use.
-  - Updates aren't instantly pushed to other open tabs - a person sees the
-    latest shared state whenever THEY next interact with or reload the page.
+SHARED FILES on the server (not browser memory):
+    shared_data/tracker.xlsx     - the uploaded PO_Delivery_Tracker_Final.xlsx
+    shared_data/state.json       - every row's status/received/binned/date/reason
+    shared_data/activity_log.json - append-only log of every action
 """
 
 import io
 import os
 import json
+import datetime as dt
 import streamlit as st
 import pandas as pd
 
@@ -39,6 +33,7 @@ st.set_page_config(page_title="PO Delivery Tracker", layout="wide")
 SHARED_DIR = "shared_data"
 SHARED_XLSX_PATH = os.path.join(SHARED_DIR, "tracker.xlsx")
 SHARED_STATE_PATH = os.path.join(SHARED_DIR, "state.json")
+ACTIVITY_LOG_PATH = os.path.join(SHARED_DIR, "activity_log.json")
 os.makedirs(SHARED_DIR, exist_ok=True)
 
 REASON_OPTIONS = ["RM Connectivity", "PM Connectivity", "Others"]
@@ -53,21 +48,29 @@ STOCK_BADGE = {
 
 
 # ---------------------------------------------------------------------------
-# SHARED STATE HELPERS (plain JSON file on disk - simple, no database needed)
+# SHARED STATE HELPERS
 # ---------------------------------------------------------------------------
-def load_shared_state():
-    if os.path.exists(SHARED_STATE_PATH):
+def load_json(path, default):
+    if os.path.exists(path):
         try:
-            with open(SHARED_STATE_PATH, "r") as f:
+            with open(path, "r") as f:
                 return json.load(f)
         except Exception:
-            return {}
-    return {}
+            return default
+    return default
+
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+def load_shared_state():
+    return load_json(SHARED_STATE_PATH, {})
 
 
 def save_shared_state(state):
-    with open(SHARED_STATE_PATH, "w") as f:
-        json.dump(state, f)
+    save_json(SHARED_STATE_PATH, state)
 
 
 def row_default(rid, state, pipeline_delayed):
@@ -80,49 +83,76 @@ def row_default(rid, state, pipeline_delayed):
     })
 
 
+def log_action(action):
+    user = st.session_state.get("user_name", "Unknown")
+    log = load_json(ACTIVITY_LOG_PATH, [])
+    log.append({
+        "time": dt.datetime.now().strftime("%d %b %Y, %I:%M %p"),
+        "user": user,
+        "action": action,
+    })
+    log = log[-1000:]  # cap growth
+    save_json(ACTIVITY_LOG_PATH, log)
+
+
 # ---------------------------------------------------------------------------
-# ACCESS CONTROL - two tiers, backward compatible with a single password
+# LOGIN PAGE
 # ---------------------------------------------------------------------------
-def check_access():
+def get_secret(name):
     try:
-        admin_pw = st.secrets.get("admin_password")
+        return st.secrets.get(name)
     except Exception:
-        admin_pw = None
-    try:
-        viewer_pw = st.secrets.get("viewer_password")
-    except Exception:
-        viewer_pw = None
-    try:
-        legacy_pw = st.secrets.get("app_password")
-    except Exception:
-        legacy_pw = None
+        return None
+
+
+def login_page():
+    admin_pw = get_secret("admin_password")
+    viewer_pw = get_secret("viewer_password")
+    legacy_pw = get_secret("app_password")
 
     if not admin_pw and not viewer_pw and not legacy_pw:
-        return "admin"  # no secrets configured at all - full access, matches old behaviour
+        st.session_state["role"] = "admin"
+        st.session_state["user_name"] = "Local User"
+        return True
 
     if st.session_state.get("role"):
-        return st.session_state["role"]
+        return True
 
-    pw = st.text_input("Password", type="password")
-    if pw:
-        if admin_pw and pw == admin_pw:
-            st.session_state["role"] = "admin"
-            st.rerun()
-        elif legacy_pw and pw == legacy_pw:
-            st.session_state["role"] = "admin"
-            st.rerun()
-        elif viewer_pw and pw == viewer_pw:
-            st.session_state["role"] = "editor"
-            st.rerun()
-        else:
-            st.error("Wrong password.")
-    return None
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1, 1.2, 1])
+    with c2:
+        st.title("📦 PO Delivery Tracker")
+        st.subheader("Login")
+        name = st.text_input("Your Name")
+        pw = st.text_input("Password", type="password")
+        if st.button("Login", use_container_width=True):
+            if not name.strip():
+                st.error("Please enter your name.")
+            elif admin_pw and pw == admin_pw:
+                st.session_state["role"] = "admin"
+                st.session_state["user_name"] = name.strip()
+                log_action("Logged in (admin)")
+                st.rerun()
+            elif legacy_pw and pw == legacy_pw:
+                st.session_state["role"] = "admin"
+                st.session_state["user_name"] = name.strip()
+                log_action("Logged in (admin)")
+                st.rerun()
+            elif viewer_pw and pw == viewer_pw:
+                st.session_state["role"] = "editor"
+                st.session_state["user_name"] = name.strip()
+                log_action("Logged in (editor)")
+                st.rerun()
+            else:
+                st.error("Wrong password.")
+    return False
 
 
-role = check_access()
-if role is None:
+if not login_page():
     st.stop()
-is_admin = role == "admin"
+
+is_admin = st.session_state["role"] == "admin"
+current_user = st.session_state["user_name"]
 
 
 def badge(text, bg, fg):
@@ -143,15 +173,17 @@ def fmt_num(n):
 
 
 # ---------------------------------------------------------------------------
-# LOAD / UPLOAD DATA (admin only can replace; everyone reads the shared file)
+# LOAD / UPLOAD DATA
 # ---------------------------------------------------------------------------
 st.title("📦 PO Delivery Tracker")
+st.caption(f"Logged in as **{current_user}** ({'Admin' if is_admin else 'Editor'})")
 
 if is_admin:
     uploaded = st.file_uploader("Upload PO_Delivery_Tracker_Final.xlsx to update everyone's view", type=["xlsx"])
     if uploaded is not None:
         with open(SHARED_XLSX_PATH, "wb") as f:
             f.write(uploaded.getbuffer())
+        log_action("Uploaded new tracker data")
         st.success("Uploaded - this is now what everyone sees.")
 
 if not os.path.exists(SHARED_XLSX_PATH):
@@ -225,10 +257,11 @@ def render_row(row, show_delay_controls):
     s_emoji, s_bg, s_fg = STOCK_BADGE.get(row["Stock Status"], ("⚪", "#E9E9E9", "#757575"))
     pending_type = "Full Pending" if row["Received Qty"] == 0 else "Partial"
     supplier = row.get("Supplier", "")
+    po_no, item_code = row["Purchase Order"], row["Item Code"]
 
     with st.container(border=True):
         st.markdown(
-            f'**{row["Purchase Order"]}** — {row["Item Code"]} · {row.get("SKU Name", "")} '
+            f'**{po_no}** — {item_code} · {row.get("SKU Name", "")} '
             f'{badge(f"{s_emoji} {row["Stock Status"]}", s_bg, s_fg)} '
             f'{badge(supplier, "#E8E8E8", "#333333") if supplier else ""}  \n'
             f'Qty: **{fmt_num(row["Qty"])}** &nbsp;·&nbsp; '
@@ -238,45 +271,60 @@ def render_row(row, show_delay_controls):
             unsafe_allow_html=True,
         )
 
-        widths = [1, 1, 0.8, 1.3, 1.5] if show_delay_controls else [1, 1, 0.8]
+        # Editors only get the status toggle (+ date/reason if Delayed).
+        # Received and Bin are admin-only.
+        n_buttons = 1 + (2 if is_admin else 0)
+        widths = ([1] * n_buttons) + ([1.3, 1.5] if show_delay_controls else [])
         cols = st.columns(widths)
+        ci = 0
 
         if rstate["status"] == "On Time":
-            if cols[0].button("🔴 Mark Delayed", key=f"toggle_{rid}"):
+            if cols[ci].button("🔴 Mark Delayed", key=f"toggle_{rid}"):
                 shared_state[rid]["status"] = "Delayed"
                 save_shared_state(shared_state)
+                log_action(f"Marked {po_no} / {item_code} as Delayed")
                 st.rerun()
         else:
-            if cols[0].button("🟢 Mark On Time", key=f"toggle_{rid}"):
+            if cols[ci].button("🟢 Mark On Time", key=f"toggle_{rid}"):
                 shared_state[rid]["status"] = "On Time"
                 save_shared_state(shared_state)
+                log_action(f"Marked {po_no} / {item_code} as On Time")
                 st.rerun()
+        ci += 1
 
-        recv_label = "✅ Received" if rstate["received"] else "📥 Mark Received"
-        if cols[1].button(recv_label, key=f"recv_{rid}"):
-            shared_state[rid]["received"] = not rstate["received"]
-            save_shared_state(shared_state)
-            st.rerun()
+        if is_admin:
+            recv_label = "✅ Received" if rstate["received"] else "📥 Mark Received"
+            if cols[ci].button(recv_label, key=f"recv_{rid}"):
+                shared_state[rid]["received"] = not rstate["received"]
+                save_shared_state(shared_state)
+                log_action(f"{'Marked' if not rstate['received'] else 'Unmarked'} {po_no} / {item_code} as Received")
+                st.rerun()
+            ci += 1
 
-        if cols[2].button("🗑️ Bin", key=f"bin_{rid}"):
-            shared_state[rid]["binned"] = True
-            save_shared_state(shared_state)
-            st.rerun()
+            if cols[ci].button("🗑️ Bin", key=f"bin_{rid}"):
+                shared_state[rid]["binned"] = True
+                save_shared_state(shared_state)
+                log_action(f"Binned {po_no} / {item_code}")
+                st.rerun()
+            ci += 1
 
         if show_delay_controls:
             existing_date = pd.to_datetime(rstate["revised_date"]).date() if rstate["revised_date"] else None
-            new_date = cols[3].date_input("Revised Date", value=existing_date, key=f"date_{rid}",
-                                           label_visibility="collapsed")
+            new_date = cols[ci].date_input("Revised Date", value=existing_date, key=f"date_{rid}",
+                                            label_visibility="collapsed")
             if new_date != existing_date:
                 shared_state[rid]["revised_date"] = new_date.isoformat() if new_date else None
                 save_shared_state(shared_state)
+                log_action(f"Set revised date for {po_no} / {item_code} to {new_date}")
+            ci += 1
 
             reason_index = REASON_OPTIONS.index(rstate["reason"]) if rstate["reason"] in REASON_OPTIONS else None
-            new_reason = cols[4].selectbox("Reason", REASON_OPTIONS, index=reason_index, key=f"reason_{rid}",
-                                            placeholder="Reason", label_visibility="collapsed")
+            new_reason = cols[ci].selectbox("Reason", REASON_OPTIONS, index=reason_index, key=f"reason_{rid}",
+                                             placeholder="Reason", label_visibility="collapsed")
             if new_reason != rstate["reason"]:
                 shared_state[rid]["reason"] = new_reason
                 save_shared_state(shared_state)
+                log_action(f"Set delay reason for {po_no} / {item_code} to {new_reason}")
 
             if not shared_state[rid]["revised_date"]:
                 st.warning("⚠️ Pick a revised delivery date.", icon="⚠️")
@@ -290,12 +338,21 @@ on_time_rows = active[active["_rid"].map(lambda r: shared_state[r]["status"] == 
 delayed_rows = active[active["_rid"].map(lambda r: shared_state[r]["status"] == "Delayed")]
 binned_rows = po_master[po_master["_rid"].map(lambda r: shared_state[r]["binned"])]
 
-t_ontime, t_delayed, t_bin, t_stock = st.tabs([
-    f"🟢 On Time ({len(on_time_rows)})",
-    f"🔴 Delayed ({len(delayed_rows)})",
-    f"🗑️ Bin ({len(binned_rows)})",
-    "📊 Stressed & Watch SKUs",
-])
+tab_labels = [f"🟢 On Time ({len(on_time_rows)})", f"🔴 Delayed ({len(delayed_rows)})"]
+if is_admin:
+    tab_labels += [f"🗑️ Bin ({len(binned_rows)})"]
+tab_labels += ["📊 Stressed & Watch SKUs"]
+if is_admin:
+    tab_labels += ["📜 Activity Log"]
+
+tabs = st.tabs(tab_labels)
+t_ontime, t_delayed = tabs[0], tabs[1]
+idx = 2
+if is_admin:
+    t_bin = tabs[idx]; idx += 1
+t_stock = tabs[idx]; idx += 1
+if is_admin:
+    t_log = tabs[idx]
 
 with t_ontime:
     if len(on_time_rows) == 0:
@@ -334,17 +391,19 @@ with t_delayed:
     else:
         st.info("Pick a date on at least one Delayed line to enable the download.")
 
-with t_bin:
-    if len(binned_rows) == 0:
-        st.success("Bin is empty.")
-    for _, row in binned_rows.iterrows():
-        rid = row["_rid"]
-        with st.container(border=True):
-            st.markdown(f'**{row["Purchase Order"]}** — {row["Item Code"]} · {row.get("SKU Name", "")}')
-            if st.button("♻️ Restore", key=f"restore_{rid}"):
-                shared_state[rid]["binned"] = False
-                save_shared_state(shared_state)
-                st.rerun()
+if is_admin:
+    with t_bin:
+        if len(binned_rows) == 0:
+            st.success("Bin is empty.")
+        for _, row in binned_rows.iterrows():
+            rid = row["_rid"]
+            with st.container(border=True):
+                st.markdown(f'**{row["Purchase Order"]}** — {row["Item Code"]} · {row.get("SKU Name", "")}')
+                if st.button("♻️ Restore", key=f"restore_{rid}"):
+                    shared_state[rid]["binned"] = False
+                    save_shared_state(shared_state)
+                    log_action(f"Restored {row['Purchase Order']} / {row['Item Code']} from Bin")
+                    st.rerun()
 
 with t_stock:
     need_cols = {"Stock Status", "SKU Name", "Total DRR", "SOH Online", "SOH Offline", "Days of Cover"}
@@ -377,3 +436,14 @@ with t_stock:
 
             st.caption("'Need Delivery By' = the date stock is projected to run out at current sales pace.")
             st.dataframe(highlight(show), use_container_width=True, hide_index=True)
+
+if is_admin:
+    with t_log:
+        st.subheader("Activity Log")
+        st.caption("Visible to admin only.")
+        log_entries = load_json(ACTIVITY_LOG_PATH, [])
+        if not log_entries:
+            st.info("No activity yet.")
+        else:
+            log_df = pd.DataFrame(log_entries[::-1])  # most recent first
+            st.dataframe(log_df, use_container_width=True, hide_index=True)
