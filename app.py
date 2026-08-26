@@ -1,46 +1,45 @@
 """
-app.py — Brillare PO Delivery Tracker
+app.py — Brillare PO Delivery Tracker (shared, multi-user)
 --------------------------------------------------------------------------------
-Tab navigation: On Time | Delayed | Bin | Stressed & Watch SKUs.
-Each PO line is a compact card: PO/SKU/Qty/Received/Pending on one line,
-action buttons right below (Mark Delayed/On Time, Mark Received, Bin).
-Delayed cards additionally show a calendar + reason picker inline - since
-they're isolated in their own tab, no scrolling past On Time rows to reach them.
+Everyone who opens this app's URL sees the SAME data and the SAME marks
+(Delayed/Received/Bin) - not separate per-browser copies. This works by
+writing to two small files on the server instead of keeping everything in
+browser memory:
+    shared_data/tracker.xlsx    - the uploaded PO_Delivery_Tracker_Final.xlsx
+    shared_data/state.json      - every row's On Time/Delayed/Received/Bin/
+                                   revised date/reason, keyed by row ID
 
-WORKFLOW:
-  1. Run your pipeline as usual: python run_stock_tracker.py
-  2. Open this app, upload PO_Delivery_Tracker_Final.xlsx
-  3. Mark delays / received / bin as needed, download Delay_Tracker.xlsx,
-     drop it in your 3P Tracker folder before the next run_stock_tracker.py run
+TWO ACCESS LEVELS (set in the app's Secrets on Streamlit Cloud):
+    admin_password  = "..."   -> can upload/replace the master data file,
+                                  AND mark Delayed/Received/Bin
+    viewer_password = "..."   -> can only mark Delayed/Received/Bin,
+                                  cannot replace the master data file
+If only admin_password is set (or neither), everyone gets full access -
+same as before, for backward compatibility.
+
+LIMITATIONS (be aware of these):
+  - Streamlit Cloud's disk is not permanent - if the app restarts (redeploy,
+    long idle period, etc.) shared_data/ is wiped and you'll need to
+    re-upload once. Your Delay/Received/Bin marks would reset too.
+  - Two people editing the exact same row at the exact same second could
+    overwrite each other (last save wins). Fine for a small team, not built
+    for heavy simultaneous use.
+  - Updates aren't instantly pushed to other open tabs - a person sees the
+    latest shared state whenever THEY next interact with or reload the page.
 """
 
 import io
+import os
+import json
 import streamlit as st
 import pandas as pd
 
 st.set_page_config(page_title="PO Delivery Tracker", layout="wide")
 
-
-def check_password():
-    try:
-        has_password = "app_password" in st.secrets
-    except Exception:
-        has_password = False
-    if not has_password:
-        return True
-    if st.session_state.get("authed", False):
-        return True
-    pw = st.text_input("Password", type="password")
-    if pw == st.secrets["app_password"]:
-        st.session_state["authed"] = True
-        st.rerun()
-    elif pw:
-        st.error("Wrong password.")
-    return False
-
-
-if not check_password():
-    st.stop()
+SHARED_DIR = "shared_data"
+SHARED_XLSX_PATH = os.path.join(SHARED_DIR, "tracker.xlsx")
+SHARED_STATE_PATH = os.path.join(SHARED_DIR, "state.json")
+os.makedirs(SHARED_DIR, exist_ok=True)
 
 REASON_OPTIONS = ["RM Connectivity", "PM Connectivity", "Others"]
 
@@ -51,6 +50,79 @@ STOCK_BADGE = {
     "Low Movement": ("⚪", "#D9D9D9", "#595959"),
     "No DRR Data": ("⚪", "#E9E9E9", "#757575"),
 }
+
+
+# ---------------------------------------------------------------------------
+# SHARED STATE HELPERS (plain JSON file on disk - simple, no database needed)
+# ---------------------------------------------------------------------------
+def load_shared_state():
+    if os.path.exists(SHARED_STATE_PATH):
+        try:
+            with open(SHARED_STATE_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_shared_state(state):
+    with open(SHARED_STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+def row_default(rid, state, pipeline_delayed):
+    return state.setdefault(rid, {
+        "status": "Delayed" if pipeline_delayed else "On Time",
+        "received": False,
+        "binned": False,
+        "revised_date": None,
+        "reason": None,
+    })
+
+
+# ---------------------------------------------------------------------------
+# ACCESS CONTROL - two tiers, backward compatible with a single password
+# ---------------------------------------------------------------------------
+def check_access():
+    try:
+        admin_pw = st.secrets.get("admin_password")
+    except Exception:
+        admin_pw = None
+    try:
+        viewer_pw = st.secrets.get("viewer_password")
+    except Exception:
+        viewer_pw = None
+    try:
+        legacy_pw = st.secrets.get("app_password")
+    except Exception:
+        legacy_pw = None
+
+    if not admin_pw and not viewer_pw and not legacy_pw:
+        return "admin"  # no secrets configured at all - full access, matches old behaviour
+
+    if st.session_state.get("role"):
+        return st.session_state["role"]
+
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if admin_pw and pw == admin_pw:
+            st.session_state["role"] = "admin"
+            st.rerun()
+        elif legacy_pw and pw == legacy_pw:
+            st.session_state["role"] = "admin"
+            st.rerun()
+        elif viewer_pw and pw == viewer_pw:
+            st.session_state["role"] = "editor"
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    return None
+
+
+role = check_access()
+if role is None:
+    st.stop()
+is_admin = role == "admin"
 
 
 def badge(text, bg, fg):
@@ -71,20 +143,29 @@ def fmt_num(n):
 
 
 # ---------------------------------------------------------------------------
-# LOAD DATA
+# LOAD / UPLOAD DATA (admin only can replace; everyone reads the shared file)
 # ---------------------------------------------------------------------------
 st.title("📦 PO Delivery Tracker")
 
-uploaded = st.file_uploader("Upload PO_Delivery_Tracker_Final.xlsx", type=["xlsx"])
-if uploaded is None:
-    st.info("👈 Upload today's tracker output to get started.")
+if is_admin:
+    uploaded = st.file_uploader("Upload PO_Delivery_Tracker_Final.xlsx to update everyone's view", type=["xlsx"])
+    if uploaded is not None:
+        with open(SHARED_XLSX_PATH, "wb") as f:
+            f.write(uploaded.getbuffer())
+        st.success("Uploaded - this is now what everyone sees.")
+
+if not os.path.exists(SHARED_XLSX_PATH):
+    st.info("No data uploaded yet." if is_admin else "No data uploaded yet - ask your admin to upload today's file.")
     st.stop()
 
+mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(SHARED_XLSX_PATH))
+st.caption(f"Showing data uploaded: {mtime.strftime('%d %b %Y, %I:%M %p')}")
+
 try:
-    po_master = pd.read_excel(uploaded, sheet_name="PO Master")
-    stock_health = pd.read_excel(uploaded, sheet_name="SKU Stock Health")
+    po_master = pd.read_excel(SHARED_XLSX_PATH, sheet_name="PO Master")
+    stock_health = pd.read_excel(SHARED_XLSX_PATH, sheet_name="SKU Stock Health")
 except Exception as e:
-    st.error(f"Couldn't read this file - is it the right output from run_stock_tracker.py? ({e})")
+    st.error(f"Couldn't read the shared file - is it the right output from run_stock_tracker.py? ({e})")
     st.stop()
 
 po_master = po_master.dropna(subset=["Item Code"]) if "Item Code" in po_master.columns else po_master
@@ -101,25 +182,13 @@ po_master["_rid"] = (
     po_master["Item Code"].astype(str)
 )
 
-# ---------------------------------------------------------------------------
-# PER-ROW STATE (button-driven fields; date/reason use native widget keys)
-#   Initialized against the FULL po_master (before any filtering below) so
-#   that applying/clearing a vendor or search filter never loses state on
-#   rows that are temporarily hidden.
-# ---------------------------------------------------------------------------
-for key in ["row_status", "row_received", "row_binned"]:
-    if key not in st.session_state:
-        st.session_state[key] = {}
-
+shared_state = load_shared_state()
 for _, row in po_master.iterrows():
-    rid = row["_rid"]
-    if rid not in st.session_state.row_status:
-        st.session_state.row_status[rid] = "Delayed" if row.get("Delivery Status") == "Delayed" else "On Time"
-    st.session_state.row_received.setdefault(rid, False)
-    st.session_state.row_binned.setdefault(rid, False)
+    row_default(row["_rid"], shared_state, row.get("Delivery Status") == "Delayed")
+save_shared_state(shared_state)
 
 # ---------------------------------------------------------------------------
-# VENDOR + SKU SEARCH FILTER BAR (applies across every tab below)
+# VENDOR + SKU SEARCH FILTER BAR
 # ---------------------------------------------------------------------------
 VENDOR_MAP = {
     "Cletza": "CLETZA LIFESCIENCE LLP",
@@ -147,11 +216,12 @@ if sku_search:
     else:
         st.caption("No open POs match that SKU.")
 
-po_master = po_filtered  # everything below (tabs, counts) now respects the filter bar
+po_master = po_filtered
 
 
 def render_row(row, show_delay_controls):
     rid = row["_rid"]
+    rstate = shared_state[rid]
     s_emoji, s_bg, s_fg = STOCK_BADGE.get(row["Stock Status"], ("⚪", "#E9E9E9", "#757575"))
     pending_type = "Full Pending" if row["Received Qty"] == 0 else "Partial"
     supplier = row.get("Supplier", "")
@@ -168,44 +238,57 @@ def render_row(row, show_delay_controls):
             unsafe_allow_html=True,
         )
 
-        ncols = 5 if show_delay_controls else 3
         widths = [1, 1, 0.8, 1.3, 1.5] if show_delay_controls else [1, 1, 0.8]
         cols = st.columns(widths)
 
-        if st.session_state.row_status[rid] == "On Time":
+        if rstate["status"] == "On Time":
             if cols[0].button("🔴 Mark Delayed", key=f"toggle_{rid}"):
-                st.session_state.row_status[rid] = "Delayed"
+                shared_state[rid]["status"] = "Delayed"
+                save_shared_state(shared_state)
                 st.rerun()
         else:
             if cols[0].button("🟢 Mark On Time", key=f"toggle_{rid}"):
-                st.session_state.row_status[rid] = "On Time"
+                shared_state[rid]["status"] = "On Time"
+                save_shared_state(shared_state)
                 st.rerun()
 
-        received_now = st.session_state.row_received[rid]
-        recv_label = "✅ Received" if received_now else "📥 Mark Received"
+        recv_label = "✅ Received" if rstate["received"] else "📥 Mark Received"
         if cols[1].button(recv_label, key=f"recv_{rid}"):
-            st.session_state.row_received[rid] = not received_now
+            shared_state[rid]["received"] = not rstate["received"]
+            save_shared_state(shared_state)
             st.rerun()
 
         if cols[2].button("🗑️ Bin", key=f"bin_{rid}"):
-            st.session_state.row_binned[rid] = True
+            shared_state[rid]["binned"] = True
+            save_shared_state(shared_state)
             st.rerun()
 
         if show_delay_controls:
-            cols[3].date_input("Revised Date", value=None, key=f"date_{rid}", label_visibility="collapsed")
-            cols[4].selectbox("Reason", REASON_OPTIONS, index=None, key=f"reason_{rid}",
-                               placeholder="Reason", label_visibility="collapsed")
-            if st.session_state.get(f"date_{rid}") is None:
+            existing_date = pd.to_datetime(rstate["revised_date"]).date() if rstate["revised_date"] else None
+            new_date = cols[3].date_input("Revised Date", value=existing_date, key=f"date_{rid}",
+                                           label_visibility="collapsed")
+            if new_date != existing_date:
+                shared_state[rid]["revised_date"] = new_date.isoformat() if new_date else None
+                save_shared_state(shared_state)
+
+            reason_index = REASON_OPTIONS.index(rstate["reason"]) if rstate["reason"] in REASON_OPTIONS else None
+            new_reason = cols[4].selectbox("Reason", REASON_OPTIONS, index=reason_index, key=f"reason_{rid}",
+                                            placeholder="Reason", label_visibility="collapsed")
+            if new_reason != rstate["reason"]:
+                shared_state[rid]["reason"] = new_reason
+                save_shared_state(shared_state)
+
+            if not shared_state[rid]["revised_date"]:
                 st.warning("⚠️ Pick a revised delivery date.", icon="⚠️")
 
 
 # ---------------------------------------------------------------------------
 # TAB NAVIGATION
 # ---------------------------------------------------------------------------
-active = po_master[~po_master["_rid"].map(st.session_state.row_binned)]
-on_time_rows = active[active["_rid"].map(lambda r: st.session_state.row_status[r] == "On Time")]
-delayed_rows = active[active["_rid"].map(lambda r: st.session_state.row_status[r] == "Delayed")]
-binned_rows = po_master[po_master["_rid"].map(st.session_state.row_binned)]
+active = po_master[~po_master["_rid"].map(lambda r: shared_state[r]["binned"])]
+on_time_rows = active[active["_rid"].map(lambda r: shared_state[r]["status"] == "On Time")]
+delayed_rows = active[active["_rid"].map(lambda r: shared_state[r]["status"] == "Delayed")]
+binned_rows = po_master[po_master["_rid"].map(lambda r: shared_state[r]["binned"])]
 
 t_ontime, t_delayed, t_bin, t_stock = st.tabs([
     f"🟢 On Time ({len(on_time_rows)})",
@@ -229,14 +312,13 @@ with t_delayed:
     st.divider()
     export_rows = []
     for _, row in delayed_rows.iterrows():
-        rid = row["_rid"]
-        d = st.session_state.get(f"date_{rid}")
-        if d:
+        rstate = shared_state[row["_rid"]]
+        if rstate["revised_date"]:
             export_rows.append({
                 "Purchase Order": row["Purchase Order"],
                 "Item Code": row["Item Code"],
-                "Revised Expected Delivery Date": d,
-                "Delay Reason": st.session_state.get(f"reason_{rid}") or "Others",
+                "Revised Expected Delivery Date": rstate["revised_date"],
+                "Delay Reason": rstate["reason"] or "Others",
             })
     if export_rows:
         export_df = pd.DataFrame(export_rows)
@@ -260,7 +342,8 @@ with t_bin:
         with st.container(border=True):
             st.markdown(f'**{row["Purchase Order"]}** — {row["Item Code"]} · {row.get("SKU Name", "")}')
             if st.button("♻️ Restore", key=f"restore_{rid}"):
-                st.session_state.row_binned[rid] = False
+                shared_state[rid]["binned"] = False
+                save_shared_state(shared_state)
                 st.rerun()
 
 with t_stock:
