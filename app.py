@@ -332,11 +332,26 @@ def delete_row(rid):
 
 
 def find_and_remove_ghost_duplicates():
-    """One-time cleanup for the position-based-ID bug: finds groups of
-    documents that represent the same real PO+SKU+RequiredBy+Qty line, and
-    where one copy is binned but another isn't (the binned one is your real
-    action; the non-binned one is a stale ghost created before this fix),
-    deletes only the ghost(s), keeps the binned record."""
+    """Cleanup for stale duplicate documents representing the same real
+    PO+SKU+RequiredBy+Qty line - handles ANY duplicate group, not just the
+    binned-vs-not-binned case. Keeps whichever copy has the most real user
+    interaction on it (binned > received > has a revised date/reason set),
+    deletes the rest. If entries are fully identical, keeps exactly one,
+    chosen deterministically so repeated runs are stable."""
+    def score(data):
+        s = 0
+        if data.get("binned"):
+            s += 4
+        if data.get("received"):
+            s += 2
+        if data.get("status") == "Delayed":
+            s += 1
+        if data.get("revised_date"):
+            s += 1
+        if data.get("reason"):
+            s += 1
+        return s
+
     all_state = load_state()
     groups = {}
     for rid, data in all_state.items():
@@ -347,10 +362,8 @@ def find_and_remove_ghost_duplicates():
     for key, entries in groups.items():
         if len(entries) <= 1:
             continue
-        binned_entries = [e for e in entries if e[1].get("binned")]
-        non_binned_entries = [e for e in entries if not e[1].get("binned")]
-        if binned_entries and non_binned_entries:
-            to_delete.extend([rid for rid, _ in non_binned_entries])
+        entries_sorted = sorted(entries, key=lambda e: (-score(e[1]), e[0]))
+        to_delete.extend([rid for rid, _ in entries_sorted[1:]])
 
     if to_delete:
         db = get_db()
@@ -528,8 +541,8 @@ if hcol3.button("Log out"):
 if is_admin:
     uploaded = st.file_uploader("Upload PO_Delivery_Tracker_Final.xlsx to update everyone's view", type=["xlsx"])
 
-    with st.expander("🧹 Clean up duplicate entries (one-time, run if a binned item is also showing in On Time/Delayed)"):
-        st.caption("Fixes stale duplicates left over from before an ID-stability bug was fixed. Safe to run anytime - only removes a duplicate when one copy is already binned.")
+    with st.expander("🧹 Clean up duplicate entries (run if any SKU is showing more than once)"):
+        st.caption("Fixes stale duplicates left over from before an ID-stability bug was fixed. Keeps whichever copy has real activity on it (marked, dated, etc.), removes the rest. Safe to run anytime.")
         if st.button("Run cleanup now"):
             removed = find_and_remove_ghost_duplicates()
             if removed:
