@@ -187,36 +187,57 @@ def send_mail(to_email, subject, html_body):
         st.warning(f"Couldn't send email to {to_email}: {e}")
 
 
-def notify_admin_of_delay(row, revised_date, admin_email):
-    html = f"""
-    <h3>Sagar committed a delivery date</h3>
-    <table border="1" cellpadding="6" cellspacing="0">
-      <tr><th>PO No.</th><td>{row['po_no']}</td></tr>
-      <tr><th>Item Code</th><td>{row['item_code']}</td></tr>
-      <tr><th>SKU Name</th><td>{row.get('sku_name', '')}</td></tr>
-      <tr><th>Promised Delivery Date</th><td>{revised_date}</td></tr>
-      <tr><th>Current SOH</th><td>{row.get('current_soh', '-')}</td></tr>
-      <tr><th>Total DRR</th><td>{row.get('total_drr', '-')}</td></tr>
-      <tr><th>Days of Cover</th><td>{row.get('days_of_cover', '-')}</td></tr>
-      <tr><th>Stock Status</th><td>{row.get('stock_status', '-')}</td></tr>
+def round_num(n):
+    """Rounds to a whole number for display - no decimals on SOH/DRR anywhere,
+    including inside emails, matching how they're shown in the app."""
+    if n is None or (isinstance(n, float) and pd.isna(n)):
+        return "-"
+    return f"{round(float(n)):,}"
+
+
+def build_batch_table_html(title, items, intro=""):
+    rows_html = "".join(
+        f"<tr><td>{i['po_no']}</td><td>{i['item_code']}</td><td>{i.get('sku_name', '')}</td>"
+        f"<td>{i.get('status', '')}</td>"
+        f"<td>{i.get('revised_date') or '-'}</td><td>{i.get('reason') or '-'}</td>"
+        f"<td>{round_num(i.get('current_soh'))}</td><td>{round_num(i.get('total_drr'))}</td>"
+        f"<td>{i.get('stock_status', '')}</td></tr>"
+        for i in items
+    )
+    return f"""
+    <h3>{title}</h3>
+    <p>{intro}</p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
+      <tr><th>PO No.</th><th>Item Code</th><th>SKU Name</th><th>Status</th>
+          <th>Promised Date</th><th>Reason</th><th>Current SOH</th><th>Total DRR</th><th>Stock Status</th></tr>
+      {rows_html}
     </table>
     """
-    send_mail(admin_email, f"Delay update: {row['po_no']} / {row['item_code']}", html)
 
 
-def notify_reason_owner(row, reason, madri_email, pratham_email):
-    owner = None
-    if reason == "PM Connectivity":
-        owner = madri_email
-    elif reason == "RM Connectivity":
-        owner = pratham_email
-    if not owner:
-        return
-    html = f"""
-    <p><b>{row['po_no']} / {row['item_code']}</b> ({row.get('sku_name', '')}) is delayed due to
-    <b>{reason}</b>. Please follow up.</p>
-    """
-    send_mail(owner, f"{reason} delay: {row['po_no']} / {row['item_code']}", html)
+def submit_updates(dirty_items, admin_email, madri_email, pratham_email, submitted_by):
+    """Sends exactly 3 batch emails (not one per row): full summary to admin,
+    RM Connectivity subset to Pratham, PM Connectivity subset to Madri."""
+    if not dirty_items:
+        return 0
+
+    admin_html = build_batch_table_html(
+        f"Delivery updates submitted by {submitted_by}", dirty_items,
+        f"{len(dirty_items)} PO line(s) were updated in this submission."
+    )
+    send_mail(admin_email, f"Delivery updates from {submitted_by} - {len(dirty_items)} line(s)", admin_html)
+
+    rm_items = [i for i in dirty_items if i.get("reason") == "RM Connectivity"]
+    if rm_items:
+        html = build_batch_table_html("RM Connectivity delays", rm_items, "Please follow up on these.")
+        send_mail(pratham_email, f"RM Connectivity delay - {len(rm_items)} line(s)", html)
+
+    pm_items = [i for i in dirty_items if i.get("reason") == "PM Connectivity"]
+    if pm_items:
+        html = build_batch_table_html("PM Connectivity delays", pm_items, "Please follow up on these.")
+        send_mail(madri_email, f"PM Connectivity delay - {len(pm_items)} line(s)", html)
+
+    return len(dirty_items)
 
 
 # ---------------------------------------------------------------------------
@@ -424,92 +445,117 @@ if sku_search:
 po_master = po_filtered
 
 
-def render_row(row, show_delay_controls):
+def render_row_body(row, show_delay_controls):
     rid = row["_rid"]
     rstate = shared_state[rid]
-    s_emoji, s_bg, s_fg = STOCK_BADGE.get(row["stock_status"], ("⚪", "#E9E9E9", "#757575"))
-    pending_type = "Full Pending" if row["received_qty"] == 0 else "Partial"
     po_no, item_code = row["po_no"], row["item_code"]
 
-    with st.container(border=True):
-        st.markdown(
-            f'**{po_no}** — {item_code} · {row.get("sku_name", "")} '
-            f'{badge(f"{s_emoji} {row["stock_status"]}", s_bg, s_fg)} '
-            f'{badge(row["supplier"], "#E8E8E8", "#333333") if row.get("supplier") else ""}  \n'
-            f'Qty: **{fmt_num(row["qty"])}** &nbsp;·&nbsp; '
-            f'Received: **{fmt_num(row["received_qty"])}** &nbsp;·&nbsp; '
-            f'Pending: **{fmt_num(row["pending_qty"])}** ({pending_type}) &nbsp;·&nbsp; '
-            f'Required By: **{fmt_date(row["Required By"])}**',
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        f'Qty: **{fmt_num(row["qty"])}** &nbsp;·&nbsp; Received: **{fmt_num(row["received_qty"])}** '
+        f'&nbsp;·&nbsp; {badge(row["supplier"], "#E8E8E8", "#333333") if row.get("supplier") else ""}',
+        unsafe_allow_html=True,
+    )
 
-        if not can_edit:
-            if show_delay_controls:
-                rd = rstate.get("revised_date")
-                rd_text = pd.to_datetime(rd).strftime("%d %b %Y") if rd else "not set yet"
-                st.caption(f"Revised Delivery Date: **{rd_text}** &nbsp;·&nbsp; Reason: **{rstate.get('reason') or '-'}**")
-            return
+    if not can_edit:
+        if show_delay_controls:
+            rd = rstate.get("revised_date")
+            rd_text = pd.to_datetime(rd).strftime("%d %b %Y") if rd else "not set yet"
+            st.caption(f"Revised Delivery Date: **{rd_text}** &nbsp;·&nbsp; Reason: **{rstate.get('reason') or '-'}**")
+        return
 
-        n_buttons = 1 + (2 if is_admin else 0)
-        widths = ([1] * n_buttons) + ([1.3, 1.5] if show_delay_controls else [])
-        cols = st.columns(widths)
-        ci = 0
+    n_buttons = 1 + (2 if is_admin else 0)
+    widths = ([1] * n_buttons) + ([1.3, 1.5] if show_delay_controls else [])
+    cols = st.columns(widths)
+    ci = 0
 
-        if rstate["status"] == "On Time":
-            if cols[ci].button("🔴 Mark Delayed", key=f"toggle_{rid}"):
-                shared_state[rid]["status"] = "Delayed"
-                save_row(rid, {"status": "Delayed"})
-                log_action(f"Marked {po_no} / {item_code} as Delayed")
-                st.rerun()
-        else:
-            if cols[ci].button("🟢 Mark On Time", key=f"toggle_{rid}"):
-                shared_state[rid]["status"] = "On Time"
-                save_row(rid, {"status": "On Time"})
-                log_action(f"Marked {po_no} / {item_code} as On Time")
-                st.rerun()
+    if rstate["status"] == "On Time":
+        if cols[ci].button("🔴 Mark Delayed", key=f"toggle_{rid}"):
+            shared_state[rid]["status"] = "Delayed"
+            save_row(rid, {"status": "Delayed"})
+            log_action(f"Marked {po_no} / {item_code} as Delayed")
+            st.session_state.setdefault("dirty_rids", set()).add(rid)
+            st.rerun()
+    else:
+        if cols[ci].button("🟢 Mark On Time", key=f"toggle_{rid}"):
+            shared_state[rid]["status"] = "On Time"
+            save_row(rid, {"status": "On Time"})
+            log_action(f"Marked {po_no} / {item_code} as On Time")
+            st.session_state.setdefault("dirty_rids", set()).add(rid)
+            st.rerun()
+    ci += 1
+
+    if is_admin:
+        recv_label = "✅ Received" if rstate["received"] else "📥 Mark Received"
+        if cols[ci].button(recv_label, key=f"recv_{rid}"):
+            new_val = not rstate["received"]
+            shared_state[rid]["received"] = new_val
+            save_row(rid, {"received": new_val})
+            log_action(f"{'Marked' if new_val else 'Unmarked'} {po_no} / {item_code} as Received")
+            st.rerun()
         ci += 1
 
-        if is_admin:
-            recv_label = "✅ Received" if rstate["received"] else "📥 Mark Received"
-            if cols[ci].button(recv_label, key=f"recv_{rid}"):
-                new_val = not rstate["received"]
-                shared_state[rid]["received"] = new_val
-                save_row(rid, {"received": new_val})
-                log_action(f"{'Marked' if new_val else 'Unmarked'} {po_no} / {item_code} as Received")
-                st.rerun()
-            ci += 1
+        if cols[ci].button("🗑️ Bin", key=f"bin_{rid}"):
+            shared_state[rid]["binned"] = True
+            save_row(rid, {"binned": True})
+            log_action(f"Binned {po_no} / {item_code}")
+            st.rerun()
+        ci += 1
 
-            if cols[ci].button("🗑️ Bin", key=f"bin_{rid}"):
-                shared_state[rid]["binned"] = True
-                save_row(rid, {"binned": True})
-                log_action(f"Binned {po_no} / {item_code}")
-                st.rerun()
-            ci += 1
+    if show_delay_controls:
+        existing_date = pd.to_datetime(rstate["revised_date"]).date() if rstate.get("revised_date") else None
+        new_date = cols[ci].date_input("Revised Date", value=existing_date, key=f"date_{rid}",
+                                        label_visibility="collapsed")
+        if new_date != existing_date:
+            shared_state[rid]["revised_date"] = new_date.isoformat() if new_date else None
+            shared_state[rid]["reminders_sent"] = []
+            save_row(rid, {"revised_date": new_date.isoformat() if new_date else None, "reminders_sent": []})
+            log_action(f"Set revised date for {po_no} / {item_code} to {new_date}")
+            if new_date:
+                st.session_state.setdefault("dirty_rids", set()).add(rid)
+        ci += 1
 
-        if show_delay_controls:
-            existing_date = pd.to_datetime(rstate["revised_date"]).date() if rstate.get("revised_date") else None
-            new_date = cols[ci].date_input("Revised Date", value=existing_date, key=f"date_{rid}",
-                                            label_visibility="collapsed")
-            if new_date != existing_date:
-                shared_state[rid]["revised_date"] = new_date.isoformat() if new_date else None
-                shared_state[rid]["reminders_sent"] = []
-                save_row(rid, {"revised_date": new_date.isoformat() if new_date else None, "reminders_sent": []})
-                log_action(f"Set revised date for {po_no} / {item_code} to {new_date}")
-                if new_date:
-                    notify_admin_of_delay(row, new_date.isoformat(), ADMIN_EMAIL)
-            ci += 1
+        reason_index = REASON_OPTIONS.index(rstate["reason"]) if rstate.get("reason") in REASON_OPTIONS else None
+        new_reason = cols[ci].selectbox("Reason", REASON_OPTIONS, index=reason_index, key=f"reason_{rid}",
+                                         placeholder="Reason", label_visibility="collapsed")
+        if new_reason != rstate.get("reason"):
+            shared_state[rid]["reason"] = new_reason
+            save_row(rid, {"reason": new_reason})
+            log_action(f"Set delay reason for {po_no} / {item_code} to {new_reason}")
+            st.session_state.setdefault("dirty_rids", set()).add(rid)
 
-            reason_index = REASON_OPTIONS.index(rstate["reason"]) if rstate.get("reason") in REASON_OPTIONS else None
-            new_reason = cols[ci].selectbox("Reason", REASON_OPTIONS, index=reason_index, key=f"reason_{rid}",
-                                             placeholder="Reason", label_visibility="collapsed")
-            if new_reason != rstate.get("reason"):
-                shared_state[rid]["reason"] = new_reason
-                save_row(rid, {"reason": new_reason})
-                log_action(f"Set delay reason for {po_no} / {item_code} to {new_reason}")
-                notify_reason_owner(row, new_reason, MADRI_EMAIL, PRATHAM_EMAIL)
+        if not shared_state[rid].get("revised_date"):
+            st.warning("⚠️ Pick a revised delivery date.", icon="⚠️")
 
-            if not shared_state[rid].get("revised_date"):
-                st.warning("⚠️ Pick a revised delivery date.", icon="⚠️")
+
+def render_row(row, show_delay_controls, collapse=False):
+    rid = row["_rid"]
+    rstate = shared_state[rid]
+    s_emoji = STOCK_BADGE.get(row["stock_status"], ("⚪",))[0]
+    status_emoji = "🟢" if rstate["status"] == "On Time" else "🔴"
+    pending_type = "Full" if row["received_qty"] == 0 else "Partial"
+
+    if collapse:
+        # Expander labels are plain text only (no HTML/markdown), so this is
+        # a plain-text one-liner - keeps 50+ rows scannable without scrolling
+        # through full cards for rows that rarely need any action.
+        header = (
+            f'{status_emoji} {row["po_no"]} — {row["item_code"]} · {row.get("sku_name", "")}  '
+            f'|  {s_emoji} {row["stock_status"]}  |  Pending {fmt_num(row["pending_qty"])} ({pending_type})  '
+            f'|  Req. By {fmt_date(row["Required By"])}'
+        )
+        with st.expander(header, expanded=False):
+            render_row_body(row, show_delay_controls)
+    else:
+        s_bg, s_fg = STOCK_BADGE.get(row["stock_status"], ("⚪", "#E9E9E9", "#757575"))[1:]
+        st.markdown(
+            f'{status_emoji} **{row["po_no"]}** — {row["item_code"]} · {row.get("sku_name", "")}  '
+            f'{badge(f"{s_emoji} {row["stock_status"]}", s_bg, s_fg)}  '
+            f'&nbsp;·&nbsp; Pending: **{fmt_num(row["pending_qty"])}** ({pending_type})'
+            f'&nbsp;·&nbsp; Required By: **{fmt_date(row["Required By"])}**',
+            unsafe_allow_html=True,
+        )
+        render_row_body(row, show_delay_controls)
+        st.divider()
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +587,7 @@ with t_ontime:
     if len(on_time_rows) == 0:
         st.success("Nothing here.")
     for _, row in on_time_rows.iterrows():
-        render_row(row, show_delay_controls=False)
+        render_row(row, show_delay_controls=False, collapse=True)
 
 with t_delayed:
     if len(delayed_rows) == 0:
@@ -551,6 +597,21 @@ with t_delayed:
 
     if can_edit:
         st.divider()
+        all_dirty = st.session_state.get("dirty_rids", set())
+        scol1, scol2 = st.columns([1, 3])
+        if scol1.button(f"📤 Submit Updates ({len(all_dirty)})", disabled=len(all_dirty) == 0,
+                         type="primary", use_container_width=True):
+            dirty_items = [dict(shared_state[r], _rid=r) for r in all_dirty if r in shared_state]
+            n = submit_updates(dirty_items, ADMIN_EMAIL, MADRI_EMAIL, PRATHAM_EMAIL, current_user)
+            log_action(f"Submitted {n} delivery update(s) - notified admin/Pratham/Madri as applicable")
+            st.session_state["dirty_rids"] = set()
+            st.success(f"Submitted {n} update(s) and sent notifications.")
+            st.rerun()
+        if len(all_dirty) == 0:
+            scol2.caption("No unsent changes right now - mark something Delayed/On Time or update a date/reason first.")
+        else:
+            scol2.caption(f"{len(all_dirty)} change(s) ready to submit. One email to admin, plus RM/PM routed to Pratham/Madri.")
+
         export_rows = []
         for _, row in delayed_rows.iterrows():
             rstate = shared_state[row["_rid"]]
@@ -570,8 +631,6 @@ with t_delayed:
                 data=buf.getvalue(), file_name="Delay_Tracker.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-        else:
-            st.info("Pick a date on at least one Delayed line to enable the download.")
 
 if is_admin:
     with t_bin:
@@ -600,8 +659,10 @@ with t_stock:
             if pd.notna(d) else "-"
         )
         urgent = urgent.sort_values(["stock_status", "total_drr"], ascending=[True, False])
-        show = urgent[["sku_name", "total_drr", "current_soh", "Need Delivery By", "stock_status"]].rename(
-            columns={"sku_name": "SKU Name", "total_drr": "Total DRR", "current_soh": "Current SOH",
+        urgent["_drr_display"] = urgent["total_drr"].apply(round_num)
+        urgent["_soh_display"] = urgent["current_soh"].apply(round_num)
+        show = urgent[["sku_name", "_drr_display", "_soh_display", "Need Delivery By", "stock_status"]].rename(
+            columns={"sku_name": "SKU Name", "_drr_display": "Total DRR", "_soh_display": "Current SOH",
                      "stock_status": "Stock Status"}
         )
 
