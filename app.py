@@ -116,22 +116,58 @@ def firestore_call(fn, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# SESSION-LOCAL CACHE (this is THE fix for the 429 quota error)
+#   Streamlit reruns the ENTIRE script on every single interaction - every
+#   click, every keystroke in a text box, every date picked. Without this,
+#   load_state()/load_users()/load_log() were each doing a full Firestore
+#   collection read on EVERY one of those reruns, for every open browser
+#   tab, which burns through Firestore's daily free-tier read quota very
+#   fast under real usage. This caches each collection's data in the
+#   session for CACHE_TTL_SECONDS, and explicitly invalidates the relevant
+#   cache the moment THIS session writes something - so you always see
+#   your own changes immediately, you just don't re-fetch from Firestore
+#   on every keystroke.
+# ---------------------------------------------------------------------------
+CACHE_TTL_SECONDS = 45
+
+
+def cached_load(cache_key, loader_fn):
+    import time
+    entry = st.session_state.get(cache_key)
+    if entry is not None and (time.time() - entry["ts"]) < CACHE_TTL_SECONDS:
+        return entry["data"]
+    data = loader_fn()
+    st.session_state[cache_key] = {"data": data, "ts": time.time()}
+    return data
+
+
+def invalidate_cache(cache_key):
+    st.session_state.pop(cache_key, None)
+
+
+# ---------------------------------------------------------------------------
 # USERS
 # ---------------------------------------------------------------------------
-def load_users():
+def _load_users_uncached():
     db = get_db()
     docs = firestore_call(lambda: list(db.collection("users").stream()))
     return {d.id: d.to_dict() for d in docs}
 
 
+def load_users():
+    return cached_load("_cache_users", _load_users_uncached)
+
+
 def save_user(username, data):
     db = get_db()
     firestore_call(db.collection("users").document(sanitize_doc_id(username.lower().strip())).set, data)
+    invalidate_cache("_cache_users")
 
 
 def delete_user(username):
     db = get_db()
     firestore_call(db.collection("users").document(sanitize_doc_id(username.lower().strip())).delete)
+    invalidate_cache("_cache_users")
 
 
 def hash_password(password, salt_hex):
@@ -168,11 +204,13 @@ def log_action(action):
 
 
 def load_log(limit=300):
-    db = get_db()
-    docs = firestore_call(lambda: list(
-        db.collection("activity_log").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(limit).stream()
-    ))
-    return [d.to_dict() for d in docs]
+    def _uncached():
+        db = get_db()
+        docs = firestore_call(lambda: list(
+            db.collection("activity_log").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(limit).stream()
+        ))
+        return [d.to_dict() for d in docs]
+    return cached_load("_cache_log", _uncached)
 
 
 # ---------------------------------------------------------------------------
@@ -266,19 +304,31 @@ def submit_updates(dirty_items, admin_email, madri_email, pratham_email, submitt
 # PO STATE (snapshot + interactive marks, one Firestore doc per PO+SKU line)
 # ---------------------------------------------------------------------------
 def load_state():
-    db = get_db()
-    docs = firestore_call(lambda: list(db.collection("po_state").stream()))
-    return {d.id: d.to_dict() for d in docs}
+    def _uncached():
+        db = get_db()
+        docs = firestore_call(lambda: list(db.collection("po_state").stream()))
+        return {d.id: d.to_dict() for d in docs}
+    return cached_load("_cache_state", _uncached)
 
 
 def save_row(rid, data):
     db = get_db()
     firestore_call(db.collection("po_state").document(rid).set, data, merge=True)
+    # Patch the cache directly instead of invalidating it - save_row fires on
+    # nearly every click (Mark Delayed, date change, reason change...), so
+    # forcing a re-read here would recreate almost the same quota problem.
+    # We already know exactly what changed, so just update the cached copy.
+    cache = st.session_state.get("_cache_state")
+    if cache is not None:
+        cache["data"].setdefault(rid, {}).update(data)
 
 
 def delete_row(rid):
     db = get_db()
     firestore_call(db.collection("po_state").document(rid).delete)
+    cache = st.session_state.get("_cache_state")
+    if cache is not None:
+        cache["data"].pop(rid, None)
 
 
 def find_and_remove_ghost_duplicates():
@@ -308,6 +358,7 @@ def find_and_remove_ghost_duplicates():
         for rid in to_delete:
             batch.delete(db.collection("po_state").document(rid))
         firestore_call(batch.commit)
+        invalidate_cache("_cache_state")
     return to_delete
 
 
@@ -458,10 +509,14 @@ def fmt_num(n):
 # ---------------------------------------------------------------------------
 # HEADER / LOGOUT
 # ---------------------------------------------------------------------------
-hcol1, hcol2 = st.columns([5, 1])
+hcol1, hcol2, hcol3 = st.columns([5, 0.8, 0.8])
 hcol1.title("📦 PO Delivery Tracker")
 hcol1.caption(f"Logged in as **{current_user}** ({st.session_state['role'].capitalize()})")
-if hcol2.button("Log out"):
+if hcol2.button("🔄 Refresh"):
+    for k in ("_cache_state", "_cache_users", "_cache_log"):
+        invalidate_cache(k)
+    st.rerun()
+if hcol3.button("Log out"):
     log_action("Logged out")
     st.session_state.pop("username", None)
     st.session_state.pop("role", None)
@@ -545,6 +600,7 @@ if is_admin:
 
         with st.spinner(f"Syncing {len(items_to_sync)} PO lines..."):
             sync_snapshots_batch(items_to_sync)
+        invalidate_cache("_cache_state")  # bulk change - worth one fresh read, unlike single-row actions
         synced = len(items_to_sync)
         log_action(f"Uploaded new tracker data ({synced} PO lines synced)")
         st.success(f"Uploaded - synced {synced} PO lines. This is now what everyone sees.")
