@@ -52,6 +52,17 @@ STOCK_BADGE = {
 }
 
 
+def sanitize_doc_id(s):
+    """Firestore document IDs can't contain '/' (parsed as a path separator)
+    or be exactly '.' or '..'. Real PO numbers in this data (e.g.
+    'POPUR2627/046') contain '/', so this must be applied to every value
+    used when building a document ID."""
+    s = str(s).replace("/", "_").replace("\\", "_")
+    if s in (".", ".."):
+        s = f"_{s}_"
+    return s
+
+
 def get_secret(name, default=None):
     try:
         val = st.secrets.get(name)
@@ -93,12 +104,12 @@ def load_users():
 
 def save_user(username, data):
     db = get_db()
-    firestore_call(db.collection("users").document(username.lower().strip()).set, data)
+    firestore_call(db.collection("users").document(sanitize_doc_id(username.lower().strip())).set, data)
 
 
 def delete_user(username):
     db = get_db()
-    firestore_call(db.collection("users").document(username.lower().strip()).delete)
+    firestore_call(db.collection("users").document(sanitize_doc_id(username.lower().strip())).delete)
 
 
 def hash_password(password, salt_hex):
@@ -112,7 +123,7 @@ def create_user_entry(password, role):
 
 
 def verify_user(users, username, password):
-    u = users.get(username.lower().strip())
+    u = users.get(sanitize_doc_id(username.lower().strip()))
     if not u:
         return None
     if hash_password(password, u["salt"]) == u["hash"]:
@@ -354,7 +365,7 @@ if is_admin:
         existing_state = load_state()
         synced = 0
         for i, row in po_master_raw.iterrows():
-            rid = f"{i}|{row['Purchase Order']}|{row['Item Code']}"
+            rid = f"{i}|{sanitize_doc_id(row['Purchase Order'])}|{sanitize_doc_id(row['Item Code'])}"
             sh = sh_lookup.get(row["Item Code"], {})
             snapshot = {
                 "po_no": str(row["Purchase Order"]), "item_code": str(row["Item Code"]),
