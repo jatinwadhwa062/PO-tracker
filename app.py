@@ -276,6 +276,37 @@ def save_row(rid, data):
     firestore_call(db.collection("po_state").document(rid).set, data, merge=True)
 
 
+def delete_row(rid):
+    db = get_db()
+    firestore_call(db.collection("po_state").document(rid).delete)
+
+
+def find_and_remove_ghost_duplicates():
+    """One-time cleanup for the position-based-ID bug: finds groups of
+    documents that represent the same real PO+SKU+RequiredBy+Qty line, and
+    where one copy is binned but another isn't (the binned one is your real
+    action; the non-binned one is a stale ghost created before this fix),
+    deletes only the ghost(s), keeps the binned record."""
+    all_state = load_state()
+    groups = {}
+    for rid, data in all_state.items():
+        key = (data.get("po_no"), data.get("item_code"), data.get("required_by"), data.get("qty"))
+        groups.setdefault(key, []).append((rid, data))
+
+    to_delete = []
+    for key, entries in groups.items():
+        if len(entries) <= 1:
+            continue
+        binned_entries = [e for e in entries if e[1].get("binned")]
+        non_binned_entries = [e for e in entries if not e[1].get("binned")]
+        if binned_entries and non_binned_entries:
+            to_delete.extend([rid for rid, _ in non_binned_entries])
+
+    for rid in to_delete:
+        delete_row(rid)
+    return to_delete
+
+
 def sync_snapshot(rid, snapshot, existing):
     """Refreshes the pipeline-computed fields (SKU/PO/stock info) on upload,
     while preserving Sagar's interactive marks if this row already existed."""
@@ -392,6 +423,17 @@ if hcol2.button("Log out"):
 # ---------------------------------------------------------------------------
 if is_admin:
     uploaded = st.file_uploader("Upload PO_Delivery_Tracker_Final.xlsx to update everyone's view", type=["xlsx"])
+
+    with st.expander("🧹 Clean up duplicate entries (one-time, run if a binned item is also showing in On Time/Delayed)"):
+        st.caption("Fixes stale duplicates left over from before an ID-stability bug was fixed. Safe to run anytime - only removes a duplicate when one copy is already binned.")
+        if st.button("Run cleanup now"):
+            removed = find_and_remove_ghost_duplicates()
+            if removed:
+                log_action(f"Cleanup: removed {len(removed)} ghost duplicate(s)")
+                st.success(f"Removed {len(removed)} stale duplicate(s).")
+            else:
+                st.info("No duplicates found - nothing to clean up.")
+            st.rerun()
     if uploaded is not None:
         try:
             po_master_raw = pd.read_excel(uploaded, sheet_name="PO Master")
@@ -407,8 +449,24 @@ if is_admin:
         po_master_raw = po_master_raw.reset_index(drop=True)
         existing_state = load_state()
         synced = 0
+        key_counts = {}
         for i, row in po_master_raw.iterrows():
-            rid = f"{i}|{sanitize_doc_id(row['Purchase Order'])}|{sanitize_doc_id(row['Item Code'])}"
+            # Stable ID built from the PO's own business fields, NOT row position -
+            # position shifts on every upload (rows get removed as they're received,
+            # new ones added, sort order changes), which was silently creating a
+            # brand-new "On Time" document for the same real PO every time instead
+            # of finding and preserving the one already binned/marked. The
+            # occurrence counter only disambiguates genuine duplicate lines
+            # (same PO+Item+Date+Qty appearing more than once in ONE upload).
+            base_key = (
+                f"{sanitize_doc_id(row['Purchase Order'])}|{sanitize_doc_id(row['Item Code'])}|"
+                f"{sanitize_doc_id(row['Required By'].date()) if pd.notna(row.get('Required By')) else 'none'}|"
+                f"{sanitize_doc_id(row.get('Qty', 0))}"
+            )
+            key_counts[base_key] = key_counts.get(base_key, 0) + 1
+            occurrence = key_counts[base_key]
+            rid = base_key if occurrence == 1 else f"{base_key}|{occurrence}"
+
             sh = sh_lookup.get(row["Item Code"], {})
             snapshot = {
                 "po_no": str(row["Purchase Order"]), "item_code": str(row["Item Code"]),
