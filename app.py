@@ -446,10 +446,14 @@ po_master = po_filtered
 
 
 def render_row_body(row, show_delay_controls):
+    """Everything shown inside an expanded tile. Stacked vertically, not
+    side-by-side - tiles sit inside a narrow grid column now, so nested
+    horizontal columns would get cramped."""
     rid = row["_rid"]
     rstate = shared_state[rid]
     po_no, item_code = row["po_no"], row["item_code"]
 
+    st.caption(f'{po_no} &nbsp;·&nbsp; Required By: **{fmt_date(row["Required By"])}**')
     st.markdown(
         f'Qty: **{fmt_num(row["qty"])}** &nbsp;·&nbsp; Received: **{fmt_num(row["received_qty"])}** '
         f'&nbsp;·&nbsp; {badge(row["supplier"], "#E8E8E8", "#333333") if row.get("supplier") else ""}',
@@ -463,48 +467,39 @@ def render_row_body(row, show_delay_controls):
             st.caption(f"Revised Delivery Date: **{rd_text}** &nbsp;·&nbsp; Reason: **{rstate.get('reason') or '-'}**")
         return
 
-    n_buttons = 1 + (2 if is_admin else 0)
-    widths = ([1] * n_buttons) + ([1.3, 1.5] if show_delay_controls else [])
-    cols = st.columns(widths)
-    ci = 0
-
     if rstate["status"] == "On Time":
-        if cols[ci].button("🔴 Mark Delayed", key=f"toggle_{rid}"):
+        if st.button("🔴 Mark Delayed", key=f"toggle_{rid}", use_container_width=True):
             shared_state[rid]["status"] = "Delayed"
             save_row(rid, {"status": "Delayed"})
             log_action(f"Marked {po_no} / {item_code} as Delayed")
             st.session_state.setdefault("dirty_rids", set()).add(rid)
             st.rerun()
     else:
-        if cols[ci].button("🟢 Mark On Time", key=f"toggle_{rid}"):
+        if st.button("🟢 Mark On Time", key=f"toggle_{rid}", use_container_width=True):
             shared_state[rid]["status"] = "On Time"
             save_row(rid, {"status": "On Time"})
             log_action(f"Marked {po_no} / {item_code} as On Time")
             st.session_state.setdefault("dirty_rids", set()).add(rid)
             st.rerun()
-    ci += 1
 
     if is_admin:
-        recv_label = "✅ Received" if rstate["received"] else "📥 Mark Received"
-        if cols[ci].button(recv_label, key=f"recv_{rid}"):
+        acol1, acol2 = st.columns(2)
+        recv_label = "✅ Received" if rstate["received"] else "📥 Received"
+        if acol1.button(recv_label, key=f"recv_{rid}", use_container_width=True):
             new_val = not rstate["received"]
             shared_state[rid]["received"] = new_val
             save_row(rid, {"received": new_val})
             log_action(f"{'Marked' if new_val else 'Unmarked'} {po_no} / {item_code} as Received")
             st.rerun()
-        ci += 1
-
-        if cols[ci].button("🗑️ Bin", key=f"bin_{rid}"):
+        if acol2.button("🗑️ Bin", key=f"bin_{rid}", use_container_width=True):
             shared_state[rid]["binned"] = True
             save_row(rid, {"binned": True})
             log_action(f"Binned {po_no} / {item_code}")
             st.rerun()
-        ci += 1
 
     if show_delay_controls:
         existing_date = pd.to_datetime(rstate["revised_date"]).date() if rstate.get("revised_date") else None
-        new_date = cols[ci].date_input("Revised Date", value=existing_date, key=f"date_{rid}",
-                                        label_visibility="collapsed")
+        new_date = st.date_input("Revised Date", value=existing_date, key=f"date_{rid}")
         if new_date != existing_date:
             shared_state[rid]["revised_date"] = new_date.isoformat() if new_date else None
             shared_state[rid]["reminders_sent"] = []
@@ -512,11 +507,10 @@ def render_row_body(row, show_delay_controls):
             log_action(f"Set revised date for {po_no} / {item_code} to {new_date}")
             if new_date:
                 st.session_state.setdefault("dirty_rids", set()).add(rid)
-        ci += 1
 
         reason_index = REASON_OPTIONS.index(rstate["reason"]) if rstate.get("reason") in REASON_OPTIONS else None
-        new_reason = cols[ci].selectbox("Reason", REASON_OPTIONS, index=reason_index, key=f"reason_{rid}",
-                                         placeholder="Reason", label_visibility="collapsed")
+        new_reason = st.selectbox("Reason", REASON_OPTIONS, index=reason_index, key=f"reason_{rid}",
+                                   placeholder="Reason")
         if new_reason != rstate.get("reason"):
             shared_state[rid]["reason"] = new_reason
             save_row(rid, {"reason": new_reason})
@@ -527,35 +521,33 @@ def render_row_body(row, show_delay_controls):
             st.warning("⚠️ Pick a revised delivery date.", icon="⚠️")
 
 
-def render_row(row, show_delay_controls, collapse=False):
+def shorten(text, n=26):
+    text = str(text)
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def render_tile(row, show_delay_controls):
+    """One compact tile: status + SKU code/name + pending qty, nothing else,
+    until clicked open. This is the whole point - scan many SKUs at a glance,
+    only expand the ones that need attention."""
     rid = row["_rid"]
     rstate = shared_state[rid]
-    s_emoji = STOCK_BADGE.get(row["stock_status"], ("⚪",))[0]
     status_emoji = "🟢" if rstate["status"] == "On Time" else "🔴"
-    pending_type = "Full" if row["received_qty"] == 0 else "Partial"
-
-    if collapse:
-        # Expander labels are plain text only (no HTML/markdown), so this is
-        # a plain-text one-liner - keeps 50+ rows scannable without scrolling
-        # through full cards for rows that rarely need any action.
-        header = (
-            f'{status_emoji} {row["po_no"]} — {row["item_code"]} · {row.get("sku_name", "")}  '
-            f'|  {s_emoji} {row["stock_status"]}  |  Pending {fmt_num(row["pending_qty"])} ({pending_type})  '
-            f'|  Req. By {fmt_date(row["Required By"])}'
-        )
-        with st.expander(header, expanded=False):
-            render_row_body(row, show_delay_controls)
-    else:
-        s_bg, s_fg = STOCK_BADGE.get(row["stock_status"], ("⚪", "#E9E9E9", "#757575"))[1:]
-        st.markdown(
-            f'{status_emoji} **{row["po_no"]}** — {row["item_code"]} · {row.get("sku_name", "")}  '
-            f'{badge(f"{s_emoji} {row["stock_status"]}", s_bg, s_fg)}  '
-            f'&nbsp;·&nbsp; Pending: **{fmt_num(row["pending_qty"])}** ({pending_type})'
-            f'&nbsp;·&nbsp; Required By: **{fmt_date(row["Required By"])}**',
-            unsafe_allow_html=True,
-        )
+    header = f'{status_emoji} {row["item_code"]} · {shorten(row.get("sku_name", ""))} — {fmt_num(row["pending_qty"])}'
+    with st.expander(header, expanded=False):
         render_row_body(row, show_delay_controls)
-        st.divider()
+
+
+def render_grid(df, show_delay_controls, n_cols=3):
+    rows = list(df.iterrows())
+    for i in range(0, len(rows), n_cols):
+        cols = st.columns(n_cols)
+        for j in range(n_cols):
+            if i + j >= len(rows):
+                break
+            _, row = rows[i + j]
+            with cols[j]:
+                render_tile(row, show_delay_controls)
 
 
 # ---------------------------------------------------------------------------
@@ -586,14 +578,12 @@ if is_admin:
 with t_ontime:
     if len(on_time_rows) == 0:
         st.success("Nothing here.")
-    for _, row in on_time_rows.iterrows():
-        render_row(row, show_delay_controls=False, collapse=True)
+    render_grid(on_time_rows, show_delay_controls=False, n_cols=3)
 
 with t_delayed:
     if len(delayed_rows) == 0:
         st.success("Nothing here.")
-    for _, row in delayed_rows.iterrows():
-        render_row(row, show_delay_controls=True)
+    render_grid(delayed_rows, show_delay_controls=True, n_cols=3)
 
     if can_edit:
         st.divider()
