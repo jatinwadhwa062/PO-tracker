@@ -446,6 +446,18 @@ if is_admin:
         stock_health_raw = stock_health_raw.dropna(subset=["Item Code"]) if "Item Code" in stock_health_raw.columns else stock_health_raw
         sh_lookup = stock_health_raw.set_index("Item Code").to_dict("index") if "Item Code" in stock_health_raw.columns else {}
 
+        # Defensive dedup: if the uploaded file itself somehow contains an
+        # exact duplicate PO+SKU line (e.g. from an upstream pipeline issue),
+        # collapse it to one BEFORE syncing - otherwise the stable-ID logic
+        # below would faithfully create two separate tracked entries for
+        # what's really the same real PO line.
+        before_dedup = len(po_master_raw)
+        po_master_raw = po_master_raw.drop_duplicates(
+            subset=["Purchase Order", "Item Code", "Qty", "Received Qty", "Pending Qty", "Required By"]
+        )
+        if len(po_master_raw) < before_dedup:
+            st.warning(f"Found and removed {before_dedup - len(po_master_raw)} exact duplicate PO+SKU line(s) in the uploaded file.")
+
         po_master_raw = po_master_raw.reset_index(drop=True)
         existing_state = load_state()
         synced = 0
