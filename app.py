@@ -504,9 +504,26 @@ VENDOR_MAP = {
 }
 
 st.divider()
-fcol1, fcol2 = st.columns([1.3, 2])
+fcol1, fcol2, fcol3 = st.columns([1.3, 1.8, 0.4])
 vendor_choice = fcol1.radio("3P Vendor", ["All 3Ps"] + list(VENDOR_MAP.keys()), horizontal=True)
-sku_search = fcol2.text_input("🔍 Search SKU Code", placeholder="e.g. RMSH200")
+
+
+def _clear_sku_search():
+    st.session_state["sku_search"] = ""
+
+
+sku_search = fcol2.text_input("🔍 Search SKU Code", placeholder="e.g. RMSH200", key="sku_search")
+fcol3.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)  # align button with the input box
+fcol3.button("✕ Clear", disabled=not sku_search, use_container_width=True, on_click=_clear_sku_search)
+
+# If the filter selection changed since last run, drop any list-selection
+# state - otherwise a previously-selected ROW POSITION could silently point
+# at a completely different SKU once the filtered list changes underneath it.
+current_filter_sig = (vendor_choice, sku_search)
+if st.session_state.get("_last_filter_sig") != current_filter_sig:
+    st.session_state.pop("list_ontime", None)
+    st.session_state.pop("list_delayed", None)
+    st.session_state["_last_filter_sig"] = current_filter_sig
 
 po_filtered = po_master.copy()
 if vendor_choice != "All 3Ps":
