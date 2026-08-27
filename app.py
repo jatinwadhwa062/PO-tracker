@@ -40,6 +40,28 @@ from firebase_admin import credentials, firestore
 
 st.set_page_config(page_title="PO Delivery Tracker", layout="wide")
 
+# Light polish via standard HTML elements only (buttons, hr, headings) -
+# deliberately NOT targeting Streamlit's internal data-testid/class names,
+# since those change across versions and would silently stop working on a
+# future Streamlit update, same category of issue we already hit twice.
+st.markdown("""
+<style>
+    div.stButton > button {
+        border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        transition: box-shadow 0.15s ease, transform 0.05s ease;
+    }
+    div.stButton > button:hover {
+        box-shadow: 0 3px 8px rgba(0,0,0,0.14);
+    }
+    div.stButton > button:active {
+        transform: scale(0.98);
+    }
+    hr { margin: 0.6rem 0; opacity: 0.4; }
+    h3 { margin-top: 0.2rem; margin-bottom: 0.6rem; }
+</style>
+""", unsafe_allow_html=True)
+
 IST = ZoneInfo("Asia/Kolkata")
 REASON_OPTIONS = ["RM Connectivity", "PM Connectivity", "Others"]
 
@@ -521,33 +543,76 @@ def render_row_body(row, show_delay_controls):
             st.warning("⚠️ Pick a revised delivery date.", icon="⚠️")
 
 
-def shorten(text, n=26):
+def shorten(text, n=40):
     text = str(text)
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
-def render_tile(row, show_delay_controls):
-    """One compact tile: status + SKU code/name + pending qty, nothing else,
-    until clicked open. This is the whole point - scan many SKUs at a glance,
-    only expand the ones that need attention."""
+def build_list_df(df):
+    """The compact, scannable master list - one real row per SKU, not a tile.
+    Renders inside a fixed-height scrolling table, so the PAGE doesn't grow
+    with row count - only the small table area scrolls."""
+    out = df.copy()
+    out["Status"] = out["_rid"].map(lambda r: "🟢 On Time" if shared_state[r]["status"] == "On Time" else "🔴 Delayed")
+    out["SKU"] = out["item_code"]
+    out["Product"] = out["sku_name"].apply(shorten)
+    out["Pending Qty"] = out["pending_qty"].apply(lambda n: round_num(n))
+    out["Required By"] = out["Required By"].apply(fmt_date)
+    out["Supplier"] = out["supplier"]
+    return out[["Status", "SKU", "Product", "Pending Qty", "Required By", "Supplier", "_rid"]]
+
+
+def render_detail_panel(row):
+    """Everything for the ONE currently-selected SKU - full info + actions.
+    At most one of these renders at a time, unlike the old tile grid where
+    up to 58 expandable action-sets existed on the page simultaneously."""
     rid = row["_rid"]
     rstate = shared_state[rid]
-    status_emoji = "🟢" if rstate["status"] == "On Time" else "🔴"
-    header = f'{status_emoji} {row["item_code"]} · {shorten(row.get("sku_name", ""))} — {fmt_num(row["pending_qty"])}'
-    with st.expander(header, expanded=False):
+    show_delay_controls = rstate["status"] == "Delayed"
+    s_emoji, s_bg, s_fg = STOCK_BADGE.get(row["stock_status"], ("⚪", "#E9E9E9", "#757575"))
+
+    with st.container(border=True):
+        st.markdown(
+            f'### {row["item_code"]} · {row.get("sku_name", "")}\n'
+            f'{badge(f"{s_emoji} {row["stock_status"]}", s_bg, s_fg)} &nbsp; '
+            f'{badge(row["supplier"], "#E8E8E8", "#333333") if row.get("supplier") else ""}',
+            unsafe_allow_html=True,
+        )
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Pending Qty", round_num(row["pending_qty"]))
+        m2.metric("Received", round_num(row["received_qty"]))
+        m3.metric("Ordered Qty", round_num(row["qty"]))
+        m4.metric("Required By", fmt_date(row["Required By"]))
+        st.caption(f'PO: {row["po_no"]}')
+
         render_row_body(row, show_delay_controls)
 
 
-def render_grid(df, show_delay_controls, n_cols=3):
-    rows = list(df.iterrows())
-    for i in range(0, len(rows), n_cols):
-        cols = st.columns(n_cols)
-        for j in range(n_cols):
-            if i + j >= len(rows):
-                break
-            _, row = rows[i + j]
-            with cols[j]:
-                render_tile(row, show_delay_controls)
+def render_master_detail(df, list_key):
+    if len(df) == 0:
+        st.success("Nothing here.")
+        return
+
+    list_df = build_list_df(df)
+    st.caption("Click any row to view and act on it below.")
+    event = st.dataframe(
+        list_df.drop(columns=["_rid"]),
+        use_container_width=True,
+        hide_index=True,
+        height=min(38 * (len(list_df) + 1) + 3, 420),
+        on_select="rerun",
+        selection_mode="single-row",
+        key=list_key,
+    )
+
+    selected_idx = event.selection.rows if event and event.selection else []
+    if selected_idx:
+        rid = list_df.iloc[selected_idx[0]]["_rid"]
+        selected_row = df[df["_rid"] == rid].iloc[0]
+        st.divider()
+        render_detail_panel(selected_row)
+    else:
+        st.info("👆 Select a row above to see full details and actions.")
 
 
 # ---------------------------------------------------------------------------
@@ -576,14 +641,10 @@ if is_admin:
     t_users = tabs[idx]
 
 with t_ontime:
-    if len(on_time_rows) == 0:
-        st.success("Nothing here.")
-    render_grid(on_time_rows, show_delay_controls=False, n_cols=3)
+    render_master_detail(on_time_rows, list_key="list_ontime")
 
 with t_delayed:
-    if len(delayed_rows) == 0:
-        st.success("Nothing here.")
-    render_grid(delayed_rows, show_delay_controls=True, n_cols=3)
+    render_master_detail(delayed_rows, list_key="list_delayed")
 
     if can_edit:
         st.divider()
