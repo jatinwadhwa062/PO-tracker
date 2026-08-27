@@ -1,46 +1,44 @@
 """
-app.py — Brillare PO Delivery Tracker (real per-user accounts)
+app.py — Brillare PO Delivery Tracker (Firestore-backed, with email triggers)
 --------------------------------------------------------------------------------
-AUTHENTICATION: real username + password per person, not a shared password.
-Passwords are hashed (PBKDF2-HMAC-SHA256, 100,000 iterations, random salt
-per user) - never stored in plain text anywhere.
+PERSISTENT STORAGE: Firestore, not local disk or Sheets - survives Streamlit
+Cloud sleeping/waking. Requires one secret:
+    firebase_service_account = { ...service account JSON... }
 
-FIRST-TIME SETUP: with no users yet, the app shows a one-time Setup screen
-gated by a `setup_password` secret (set this in Streamlit Secrets - only
-you should know it). Use it once to create your own admin account. After
-that, the Setup screen never appears again - it's a normal login, and you
-manage further accounts from the "Manage Users" tab inside the app.
+FIRESTORE COLLECTIONS:
+    users/{username}        - {salt, hash, role}
+    po_state/{rid}           - snapshot (PO/SKU/stock info, refreshed every
+                                upload) + interactive marks (status/received/
+                                binned/revised_date/reason/reminders_sent),
+                                preserved across uploads
+    activity_log/{auto_id}   - every action, admin-only to view
+    mail/{auto_id}           - documents here are picked up and actually sent
+                                by the Firebase "Trigger Email" extension
 
-ROLES:
-    admin  -> upload data, Mark Delayed/On Time, Mark Received, Bin/Restore,
-              see the Activity Log, manage user accounts
-    editor -> can see everything and Mark Delayed/On Time, cannot Mark
-              Received or Bin, no access to Activity Log or Manage Users
+EMAIL TRIGGERS (fired immediately from this app, not scheduled):
+    1. Sagar sets/changes a revised delivery date -> emails you (admin_email)
+       with SKU, promised date, Current SOH, Total DRR, Days of Cover, Status
+    2. Sagar picks a delay reason -> routes to Madri (PM Connectivity) or
+       Pratham (RM Connectivity). "Others" sends nothing - handled verbally.
+    The 15/7/1-day reminder emails to Sagar are a SEPARATE, genuinely
+    scheduled job - see functions/main.py, since Streamlit itself has no
+    background process to run that on a clock.
 
-SHARED FILES on the server:
-    shared_data/users.json        - username -> {salt, hash, role}
-    shared_data/tracker.xlsx      - the uploaded PO_Delivery_Tracker_Final.xlsx
-    shared_data/state.json        - every row's status/received/binned/date/reason
-    shared_data/activity_log.json - append-only log of every action
+ROLES: admin (full control) / editor (mark Delayed/On Time only) /
+       viewer (read-only, zero interactive elements)
 """
 
 import io
-import os
 import json
 import hashlib
 import datetime as dt
 from zoneinfo import ZoneInfo
 import streamlit as st
 import pandas as pd
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 st.set_page_config(page_title="PO Delivery Tracker", layout="wide")
-
-SHARED_DIR = "shared_data"
-USERS_PATH = os.path.join(SHARED_DIR, "users.json")
-SHARED_XLSX_PATH = os.path.join(SHARED_DIR, "tracker.xlsx")
-SHARED_STATE_PATH = os.path.join(SHARED_DIR, "state.json")
-ACTIVITY_LOG_PATH = os.path.join(SHARED_DIR, "activity_log.json")
-os.makedirs(SHARED_DIR, exist_ok=True)
 
 IST = ZoneInfo("Asia/Kolkata")
 REASON_OPTIONS = ["RM Connectivity", "PM Connectivity", "Others"]
@@ -54,35 +52,63 @@ STOCK_BADGE = {
 }
 
 
-# ---------------------------------------------------------------------------
-# JSON FILE HELPERS
-# ---------------------------------------------------------------------------
-def load_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except Exception:
-            return default
-    return default
-
-
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f)
+def get_secret(name, default=None):
+    try:
+        val = st.secrets.get(name)
+        return val if val is not None else default
+    except Exception:
+        return default
 
 
 # ---------------------------------------------------------------------------
-# PASSWORD HASHING - PBKDF2-HMAC-SHA256, random salt per user, no plaintext
+# FIRESTORE CLIENT
 # ---------------------------------------------------------------------------
+@st.cache_resource
+def get_db():
+    if not firebase_admin._apps:
+        cred_dict = dict(st.secrets["firebase_service_account"])
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+
+def firestore_call(fn, *args, **kwargs):
+    """Wraps every Firestore call so a misconfigured/unreachable backend
+    fails with a clear message instead of a cryptic crash."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        st.error(f"Couldn't reach Firestore ({e}). Check firebase_service_account in Secrets.")
+        st.stop()
+
+
+# ---------------------------------------------------------------------------
+# USERS
+# ---------------------------------------------------------------------------
+def load_users():
+    db = get_db()
+    docs = firestore_call(lambda: list(db.collection("users").stream()))
+    return {d.id: d.to_dict() for d in docs}
+
+
+def save_user(username, data):
+    db = get_db()
+    firestore_call(db.collection("users").document(username.lower().strip()).set, data)
+
+
+def delete_user(username):
+    db = get_db()
+    firestore_call(db.collection("users").document(username.lower().strip()).delete)
+
+
 def hash_password(password, salt_hex):
     return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), 100_000).hex()
 
 
-def create_user(users, username, password, role):
+def create_user_entry(password, role):
+    import os
     salt = os.urandom(16).hex()
-    users[username.lower().strip()] = {"salt": salt, "hash": hash_password(password, salt), "role": role}
-    return users
+    return {"salt": salt, "hash": hash_password(password, salt), "role": role}
 
 
 def verify_user(users, username, password):
@@ -94,25 +120,132 @@ def verify_user(users, username, password):
     return None
 
 
+# ---------------------------------------------------------------------------
+# ACTIVITY LOG
+# ---------------------------------------------------------------------------
 def log_action(action):
+    db = get_db()
     user = st.session_state.get("username", "Unknown")
-    log = load_json(ACTIVITY_LOG_PATH, [])
-    log.append({"time": dt.datetime.now(IST).strftime("%d %b %Y, %I:%M %p"), "user": user, "action": action})
-    save_json(ACTIVITY_LOG_PATH, log[-1000:])
+    firestore_call(db.collection("activity_log").add, {
+        "time": dt.datetime.now(IST).strftime("%d %b %Y, %I:%M %p"),
+        "timestamp": firestore.SERVER_TIMESTAMP,
+        "user": user,
+        "action": action,
+    })
 
 
-def get_secret(name):
+def load_log(limit=300):
+    db = get_db()
+    docs = firestore_call(lambda: list(
+        db.collection("activity_log").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(limit).stream()
+    ))
+    return [d.to_dict() for d in docs]
+
+
+# ---------------------------------------------------------------------------
+# EMAIL (writes to the 'mail' collection - the Firebase Trigger Email
+# extension watches this and actually sends the message)
+# ---------------------------------------------------------------------------
+def send_mail(to_email, subject, html_body):
+    """Sends email directly via Gmail SMTP - no Firebase Extension needed
+    (Firebase Extensions are being retired March 2027, so avoiding that
+    dependency entirely rather than building on something already sunset)."""
+    if not to_email:
+        return
+    gmail_user = get_secret("gmail_user")
+    gmail_app_password = get_secret("gmail_app_password")
+    if not gmail_user or not gmail_app_password:
+        st.warning(f"Email not sent to {to_email} - gmail_user/gmail_app_password not set in Secrets.")
+        return
+
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = gmail_user
+    msg["To"] = to_email if isinstance(to_email, str) else ", ".join(to_email)
+    msg.attach(MIMEText(html_body, "html"))
+
     try:
-        return st.secrets.get(name)
-    except Exception:
-        return None
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(gmail_user, gmail_app_password)
+            server.sendmail(gmail_user, [to_email] if isinstance(to_email, str) else to_email, msg.as_string())
+    except Exception as e:
+        st.warning(f"Couldn't send email to {to_email}: {e}")
+
+
+def notify_admin_of_delay(row, revised_date, admin_email):
+    html = f"""
+    <h3>Sagar committed a delivery date</h3>
+    <table border="1" cellpadding="6" cellspacing="0">
+      <tr><th>PO No.</th><td>{row['po_no']}</td></tr>
+      <tr><th>Item Code</th><td>{row['item_code']}</td></tr>
+      <tr><th>SKU Name</th><td>{row.get('sku_name', '')}</td></tr>
+      <tr><th>Promised Delivery Date</th><td>{revised_date}</td></tr>
+      <tr><th>Current SOH</th><td>{row.get('current_soh', '-')}</td></tr>
+      <tr><th>Total DRR</th><td>{row.get('total_drr', '-')}</td></tr>
+      <tr><th>Days of Cover</th><td>{row.get('days_of_cover', '-')}</td></tr>
+      <tr><th>Stock Status</th><td>{row.get('stock_status', '-')}</td></tr>
+    </table>
+    """
+    send_mail(admin_email, f"Delay update: {row['po_no']} / {row['item_code']}", html)
+
+
+def notify_reason_owner(row, reason, madri_email, pratham_email):
+    owner = None
+    if reason == "PM Connectivity":
+        owner = madri_email
+    elif reason == "RM Connectivity":
+        owner = pratham_email
+    if not owner:
+        return
+    html = f"""
+    <p><b>{row['po_no']} / {row['item_code']}</b> ({row.get('sku_name', '')}) is delayed due to
+    <b>{reason}</b>. Please follow up.</p>
+    """
+    send_mail(owner, f"{reason} delay: {row['po_no']} / {row['item_code']}", html)
+
+
+# ---------------------------------------------------------------------------
+# PO STATE (snapshot + interactive marks, one Firestore doc per PO+SKU line)
+# ---------------------------------------------------------------------------
+def load_state():
+    db = get_db()
+    docs = firestore_call(lambda: list(db.collection("po_state").stream()))
+    return {d.id: d.to_dict() for d in docs}
+
+
+def save_row(rid, data):
+    db = get_db()
+    firestore_call(db.collection("po_state").document(rid).set, data, merge=True)
+
+
+def sync_snapshot(rid, snapshot, existing):
+    """Refreshes the pipeline-computed fields (SKU/PO/stock info) on upload,
+    while preserving Sagar's interactive marks if this row already existed."""
+    data = dict(snapshot)
+    if existing:
+        for k in ("status", "received", "binned", "revised_date", "reason", "reminders_sent"):
+            if k in existing:
+                data[k] = existing[k]
+    else:
+        data.setdefault("status", "Delayed" if snapshot.get("pipeline_delayed") else "On Time")
+        data.setdefault("received", False)
+        data.setdefault("binned", False)
+        data.setdefault("revised_date", None)
+        data.setdefault("reason", None)
+        data.setdefault("reminders_sent", [])
+    save_row(rid, data)
+    return data
 
 
 # ---------------------------------------------------------------------------
 # LOGIN / FIRST-TIME SETUP
 # ---------------------------------------------------------------------------
 def auth_gate():
-    users = load_json(USERS_PATH, {})
+    users = load_users()
 
     if st.session_state.get("username"):
         return True
@@ -123,12 +256,10 @@ def auth_gate():
         st.title("📦 PO Delivery Tracker")
 
         if not users:
-            # ---- FIRST-TIME SETUP: create the first (admin) account ----
             st.subheader("First-time Setup")
             st.caption("No accounts exist yet. Create the first admin account to get started.")
             setup_pw_secret = get_secret("setup_password")
-            setup_pw = st.text_input("Setup Password", type="password",
-                                      help="Set this in Streamlit Secrets as setup_password")
+            setup_pw = st.text_input("Setup Password", type="password")
             new_username = st.text_input("Choose a Username")
             new_password = st.text_input("Choose a Password", type="password")
             if st.button("Create Admin Account", use_container_width=True):
@@ -139,15 +270,13 @@ def auth_gate():
                 elif not new_username.strip() or not new_password:
                     st.error("Enter a username and password.")
                 else:
-                    create_user(users, new_username, new_password, "admin")
-                    save_json(USERS_PATH, users)
+                    save_user(new_username, create_user_entry(new_password, "admin"))
                     st.session_state["username"] = new_username.strip()
                     st.session_state["role"] = "admin"
                     log_action("Created first admin account and logged in")
                     st.rerun()
             return False
 
-        # ---- NORMAL LOGIN ----
         st.subheader("Login")
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
@@ -167,8 +296,12 @@ if not auth_gate():
     st.stop()
 
 is_admin = st.session_state["role"] == "admin"
-can_edit = st.session_state["role"] in ("admin", "editor")  # viewer = neither
+can_edit = st.session_state["role"] in ("admin", "editor")
 current_user = st.session_state["username"]
+
+ADMIN_EMAIL = get_secret("admin_email", "you@example.com")
+MADRI_EMAIL = get_secret("madri_email", "madri@example.com")
+PRATHAM_EMAIL = get_secret("pratham_email", "pratham@example.com")
 
 
 def badge(text, bg, fg):
@@ -193,7 +326,7 @@ def fmt_num(n):
 # ---------------------------------------------------------------------------
 hcol1, hcol2 = st.columns([5, 1])
 hcol1.title("📦 PO Delivery Tracker")
-hcol1.caption(f"Logged in as **{current_user}** ({'Admin' if is_admin else 'Editor'})")
+hcol1.caption(f"Logged in as **{current_user}** ({st.session_state['role'].capitalize()})")
 if hcol2.button("Log out"):
     log_action("Logged out")
     st.session_state.pop("username", None)
@@ -206,51 +339,48 @@ if hcol2.button("Log out"):
 if is_admin:
     uploaded = st.file_uploader("Upload PO_Delivery_Tracker_Final.xlsx to update everyone's view", type=["xlsx"])
     if uploaded is not None:
-        with open(SHARED_XLSX_PATH, "wb") as f:
-            f.write(uploaded.getbuffer())
-        log_action("Uploaded new tracker data")
-        st.success("Uploaded - this is now what everyone sees.")
+        try:
+            po_master_raw = pd.read_excel(uploaded, sheet_name="PO Master")
+            stock_health_raw = pd.read_excel(uploaded, sheet_name="SKU Stock Health")
+        except Exception as e:
+            st.error(f"Couldn't read this file - is it the right output from run_stock_tracker.py? ({e})")
+            st.stop()
 
-if not os.path.exists(SHARED_XLSX_PATH):
+        po_master_raw = po_master_raw.dropna(subset=["Item Code"]) if "Item Code" in po_master_raw.columns else po_master_raw
+        stock_health_raw = stock_health_raw.dropna(subset=["Item Code"]) if "Item Code" in stock_health_raw.columns else stock_health_raw
+        sh_lookup = stock_health_raw.set_index("Item Code").to_dict("index") if "Item Code" in stock_health_raw.columns else {}
+
+        po_master_raw = po_master_raw.reset_index(drop=True)
+        existing_state = load_state()
+        synced = 0
+        for i, row in po_master_raw.iterrows():
+            rid = f"{i}|{row['Purchase Order']}|{row['Item Code']}"
+            sh = sh_lookup.get(row["Item Code"], {})
+            snapshot = {
+                "po_no": str(row["Purchase Order"]), "item_code": str(row["Item Code"]),
+                "sku_name": str(row.get("SKU Name", "")), "supplier": str(row.get("Supplier", "")),
+                "qty": float(row.get("Qty", 0)), "received_qty": float(row.get("Received Qty", 0)),
+                "pending_qty": float(row.get("Pending Qty", 0)),
+                "required_by": str(row["Required By"].date()) if pd.notna(row.get("Required By")) else None,
+                "total_drr": float(sh.get("Total DRR", 0)) if pd.notna(sh.get("Total DRR")) else 0,
+                "current_soh": float(sh.get("SOH Online", 0) or 0) + float(sh.get("SOH Offline", 0) or 0),
+                "days_of_cover": float(sh["Days of Cover"]) if pd.notna(sh.get("Days of Cover")) else None,
+                "stock_status": sh.get("Stock Status", "No DRR Data"),
+                "pipeline_delayed": row.get("Delivery Status") == "Delayed",
+            }
+            sync_snapshot(rid, snapshot, existing_state.get(rid))
+            synced += 1
+        log_action(f"Uploaded new tracker data ({synced} PO lines synced)")
+        st.success(f"Uploaded - synced {synced} PO lines. This is now what everyone sees.")
+        st.rerun()
+
+shared_state = load_state()
+if not shared_state:
     st.info("No data uploaded yet." if is_admin else "No data uploaded yet - ask your admin to upload today's file.")
     st.stop()
 
-mtime = pd.Timestamp.fromtimestamp(os.path.getmtime(SHARED_XLSX_PATH), tz="UTC").tz_convert(IST)
-st.caption(f"Showing data uploaded: {mtime.strftime('%d %b %Y, %I:%M %p')}")
-
-try:
-    po_master = pd.read_excel(SHARED_XLSX_PATH, sheet_name="PO Master")
-    stock_health = pd.read_excel(SHARED_XLSX_PATH, sheet_name="SKU Stock Health")
-except Exception as e:
-    st.error(f"Couldn't read the shared file - is it the right output from run_stock_tracker.py? ({e})")
-    st.stop()
-
-po_master = po_master.dropna(subset=["Item Code"]) if "Item Code" in po_master.columns else po_master
-stock_health = stock_health.dropna(subset=["Item Code"]) if "Item Code" in stock_health.columns else stock_health
-
-lookup_cols = [c for c in ["Item Code", "Stock Status"] if c in stock_health.columns]
-po_master = po_master.merge(stock_health[lookup_cols], on="Item Code", how="left")
-po_master["Stock Status"] = po_master["Stock Status"].fillna("No DRR Data")
-po_master["Required By"] = pd.to_datetime(po_master["Required By"], errors="coerce")
-po_master = po_master.reset_index(drop=True)
-po_master["_rid"] = (
-    po_master.index.astype(str) + "|" +
-    po_master["Purchase Order"].astype(str) + "|" +
-    po_master["Item Code"].astype(str)
-)
-
-
-def row_default(rid, state, pipeline_delayed):
-    return state.setdefault(rid, {
-        "status": "Delayed" if pipeline_delayed else "On Time",
-        "received": False, "binned": False, "revised_date": None, "reason": None,
-    })
-
-
-shared_state = load_json(SHARED_STATE_PATH, {})
-for _, row in po_master.iterrows():
-    row_default(row["_rid"], shared_state, row.get("Delivery Status") == "Delayed")
-save_json(SHARED_STATE_PATH, shared_state)
+po_master = pd.DataFrame([{**v, "_rid": k} for k, v in shared_state.items()])
+po_master["Required By"] = pd.to_datetime(po_master["required_by"], errors="coerce")
 
 # ---------------------------------------------------------------------------
 # VENDOR + SKU SEARCH FILTER BAR
@@ -267,15 +397,14 @@ vendor_choice = fcol1.radio("3P Vendor", ["All 3Ps"] + list(VENDOR_MAP.keys()), 
 sku_search = fcol2.text_input("🔍 Search SKU Code", placeholder="e.g. RMSH200")
 
 po_filtered = po_master.copy()
-if vendor_choice != "All 3Ps" and "Supplier" in po_filtered.columns:
-    po_filtered = po_filtered[po_filtered["Supplier"].astype(str).str.strip() == VENDOR_MAP[vendor_choice]]
+if vendor_choice != "All 3Ps":
+    po_filtered = po_filtered[po_filtered["supplier"].astype(str).str.strip() == VENDOR_MAP[vendor_choice]]
 if sku_search:
-    mask = po_filtered["Item Code"].astype(str).str.contains(sku_search, case=False, na=False)
-    if "SKU Name" in po_filtered.columns:
-        mask |= po_filtered["SKU Name"].astype(str).str.contains(sku_search, case=False, na=False)
+    mask = po_filtered["item_code"].astype(str).str.contains(sku_search, case=False, na=False)
+    mask |= po_filtered["sku_name"].astype(str).str.contains(sku_search, case=False, na=False)
     po_filtered = po_filtered[mask]
     if len(po_filtered):
-        matched_vendors = sorted(po_filtered["Supplier"].dropna().unique()) if "Supplier" in po_filtered.columns else []
+        matched_vendors = sorted(po_filtered["supplier"].dropna().unique())
         if matched_vendors:
             st.caption(f"Found in: {', '.join(matched_vendors)}")
     else:
@@ -287,29 +416,27 @@ po_master = po_filtered
 def render_row(row, show_delay_controls):
     rid = row["_rid"]
     rstate = shared_state[rid]
-    s_emoji, s_bg, s_fg = STOCK_BADGE.get(row["Stock Status"], ("⚪", "#E9E9E9", "#757575"))
-    pending_type = "Full Pending" if row["Received Qty"] == 0 else "Partial"
-    supplier = row.get("Supplier", "")
-    po_no, item_code = row["Purchase Order"], row["Item Code"]
+    s_emoji, s_bg, s_fg = STOCK_BADGE.get(row["stock_status"], ("⚪", "#E9E9E9", "#757575"))
+    pending_type = "Full Pending" if row["received_qty"] == 0 else "Partial"
+    po_no, item_code = row["po_no"], row["item_code"]
 
     with st.container(border=True):
         st.markdown(
-            f'**{po_no}** — {item_code} · {row.get("SKU Name", "")} '
-            f'{badge(f"{s_emoji} {row["Stock Status"]}", s_bg, s_fg)} '
-            f'{badge(supplier, "#E8E8E8", "#333333") if supplier else ""}  \n'
-            f'Qty: **{fmt_num(row["Qty"])}** &nbsp;·&nbsp; '
-            f'Received: **{fmt_num(row["Received Qty"])}** &nbsp;·&nbsp; '
-            f'Pending: **{fmt_num(row["Pending Qty"])}** ({pending_type}) &nbsp;·&nbsp; '
+            f'**{po_no}** — {item_code} · {row.get("sku_name", "")} '
+            f'{badge(f"{s_emoji} {row["stock_status"]}", s_bg, s_fg)} '
+            f'{badge(row["supplier"], "#E8E8E8", "#333333") if row.get("supplier") else ""}  \n'
+            f'Qty: **{fmt_num(row["qty"])}** &nbsp;·&nbsp; '
+            f'Received: **{fmt_num(row["received_qty"])}** &nbsp;·&nbsp; '
+            f'Pending: **{fmt_num(row["pending_qty"])}** ({pending_type}) &nbsp;·&nbsp; '
             f'Required By: **{fmt_date(row["Required By"])}**',
             unsafe_allow_html=True,
         )
 
         if not can_edit:
-            # Viewer: read-only, zero buttons/widgets - just show current status as text
             if show_delay_controls:
-                rd = rstate["revised_date"]
+                rd = rstate.get("revised_date")
                 rd_text = pd.to_datetime(rd).strftime("%d %b %Y") if rd else "not set yet"
-                st.caption(f"Revised Delivery Date: **{rd_text}** &nbsp;·&nbsp; Reason: **{rstate['reason'] or '-'}**")
+                st.caption(f"Revised Delivery Date: **{rd_text}** &nbsp;·&nbsp; Reason: **{rstate.get('reason') or '-'}**")
             return
 
         n_buttons = 1 + (2 if is_admin else 0)
@@ -320,13 +447,13 @@ def render_row(row, show_delay_controls):
         if rstate["status"] == "On Time":
             if cols[ci].button("🔴 Mark Delayed", key=f"toggle_{rid}"):
                 shared_state[rid]["status"] = "Delayed"
-                save_json(SHARED_STATE_PATH, shared_state)
+                save_row(rid, {"status": "Delayed"})
                 log_action(f"Marked {po_no} / {item_code} as Delayed")
                 st.rerun()
         else:
             if cols[ci].button("🟢 Mark On Time", key=f"toggle_{rid}"):
                 shared_state[rid]["status"] = "On Time"
-                save_json(SHARED_STATE_PATH, shared_state)
+                save_row(rid, {"status": "On Time"})
                 log_action(f"Marked {po_no} / {item_code} as On Time")
                 st.rerun()
         ci += 1
@@ -334,38 +461,43 @@ def render_row(row, show_delay_controls):
         if is_admin:
             recv_label = "✅ Received" if rstate["received"] else "📥 Mark Received"
             if cols[ci].button(recv_label, key=f"recv_{rid}"):
-                shared_state[rid]["received"] = not rstate["received"]
-                save_json(SHARED_STATE_PATH, shared_state)
-                log_action(f"{'Marked' if not rstate['received'] else 'Unmarked'} {po_no} / {item_code} as Received")
+                new_val = not rstate["received"]
+                shared_state[rid]["received"] = new_val
+                save_row(rid, {"received": new_val})
+                log_action(f"{'Marked' if new_val else 'Unmarked'} {po_no} / {item_code} as Received")
                 st.rerun()
             ci += 1
 
             if cols[ci].button("🗑️ Bin", key=f"bin_{rid}"):
                 shared_state[rid]["binned"] = True
-                save_json(SHARED_STATE_PATH, shared_state)
+                save_row(rid, {"binned": True})
                 log_action(f"Binned {po_no} / {item_code}")
                 st.rerun()
             ci += 1
 
         if show_delay_controls:
-            existing_date = pd.to_datetime(rstate["revised_date"]).date() if rstate["revised_date"] else None
+            existing_date = pd.to_datetime(rstate["revised_date"]).date() if rstate.get("revised_date") else None
             new_date = cols[ci].date_input("Revised Date", value=existing_date, key=f"date_{rid}",
                                             label_visibility="collapsed")
             if new_date != existing_date:
                 shared_state[rid]["revised_date"] = new_date.isoformat() if new_date else None
-                save_json(SHARED_STATE_PATH, shared_state)
+                shared_state[rid]["reminders_sent"] = []
+                save_row(rid, {"revised_date": new_date.isoformat() if new_date else None, "reminders_sent": []})
                 log_action(f"Set revised date for {po_no} / {item_code} to {new_date}")
+                if new_date:
+                    notify_admin_of_delay(row, new_date.isoformat(), ADMIN_EMAIL)
             ci += 1
 
-            reason_index = REASON_OPTIONS.index(rstate["reason"]) if rstate["reason"] in REASON_OPTIONS else None
+            reason_index = REASON_OPTIONS.index(rstate["reason"]) if rstate.get("reason") in REASON_OPTIONS else None
             new_reason = cols[ci].selectbox("Reason", REASON_OPTIONS, index=reason_index, key=f"reason_{rid}",
                                              placeholder="Reason", label_visibility="collapsed")
-            if new_reason != rstate["reason"]:
+            if new_reason != rstate.get("reason"):
                 shared_state[rid]["reason"] = new_reason
-                save_json(SHARED_STATE_PATH, shared_state)
+                save_row(rid, {"reason": new_reason})
                 log_action(f"Set delay reason for {po_no} / {item_code} to {new_reason}")
+                notify_reason_owner(row, new_reason, MADRI_EMAIL, PRATHAM_EMAIL)
 
-            if not shared_state[rid]["revised_date"]:
+            if not shared_state[rid].get("revised_date"):
                 st.warning("⚠️ Pick a revised delivery date.", icon="⚠️")
 
 
@@ -411,11 +543,11 @@ with t_delayed:
         export_rows = []
         for _, row in delayed_rows.iterrows():
             rstate = shared_state[row["_rid"]]
-            if rstate["revised_date"]:
+            if rstate.get("revised_date"):
                 export_rows.append({
-                    "Purchase Order": row["Purchase Order"], "Item Code": row["Item Code"],
+                    "Purchase Order": row["po_no"], "Item Code": row["item_code"],
                     "Revised Expected Delivery Date": rstate["revised_date"],
-                    "Delay Reason": rstate["reason"] or "Others",
+                    "Delay Reason": rstate.get("reason") or "Others",
                 })
         if export_rows:
             export_df = pd.DataFrame(export_rows)
@@ -427,7 +559,6 @@ with t_delayed:
                 data=buf.getvalue(), file_name="Delay_Tracker.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            st.caption("Drop this into your 3P Tracker folder before the next run_stock_tracker.py run.")
         else:
             st.info("Pick a date on at least one Delayed line to enable the download.")
 
@@ -438,59 +569,54 @@ if is_admin:
         for _, row in binned_rows.iterrows():
             rid = row["_rid"]
             with st.container(border=True):
-                st.markdown(f'**{row["Purchase Order"]}** — {row["Item Code"]} · {row.get("SKU Name", "")}')
+                st.markdown(f'**{row["po_no"]}** — {row["item_code"]} · {row.get("sku_name", "")}')
                 if st.button("♻️ Restore", key=f"restore_{rid}"):
                     shared_state[rid]["binned"] = False
-                    save_json(SHARED_STATE_PATH, shared_state)
-                    log_action(f"Restored {row['Purchase Order']} / {row['Item Code']} from Bin")
+                    save_row(rid, {"binned": False})
+                    log_action(f"Restored {row['po_no']} / {row['item_code']} from Bin")
                     st.rerun()
 
 with t_stock:
-    need_cols = {"Stock Status", "SKU Name", "Total DRR", "SOH Online", "SOH Offline", "Days of Cover"}
-    if not need_cols.issubset(stock_health.columns):
-        st.warning("Some columns needed for this section aren't in the uploaded file.")
+    urgent = po_master[po_master["stock_status"].isin(["Stressed", "Watch"])].copy()
+    if sku_search:
+        pass  # already filtered above via po_master
+    urgent = urgent.drop_duplicates(subset=["item_code"])
+    if len(urgent) == 0:
+        st.success("No Stressed or Watch SKUs right now.")
     else:
-        urgent = stock_health[stock_health["Stock Status"].isin(["Stressed", "Watch"])].copy()
-        if sku_search:
-            mask3 = urgent["Item Code"].astype(str).str.contains(sku_search, case=False, na=False)
-            if "SKU Name" in urgent.columns:
-                mask3 |= urgent["SKU Name"].astype(str).str.contains(sku_search, case=False, na=False)
-            urgent = urgent[mask3]
-        if len(urgent) == 0:
-            st.success("No Stressed or Watch SKUs right now.")
-        else:
-            urgent["Current SOH"] = urgent["SOH Online"].fillna(0) + urgent["SOH Offline"].fillna(0)
-            urgent["Need Delivery By"] = urgent["Days of Cover"].apply(
-                lambda d: (pd.Timestamp.today().normalize() + pd.Timedelta(days=int(d))).strftime("%d %b %Y")
-                if pd.notna(d) else "-"
-            )
-            urgent = urgent.sort_values(["Stock Status", "Total DRR"], ascending=[True, False])
-            show = urgent[["SKU Name", "Total DRR", "Current SOH", "Need Delivery By", "Stock Status"]]
+        urgent["Need Delivery By"] = urgent["days_of_cover"].apply(
+            lambda d: (pd.Timestamp.today().normalize() + pd.Timedelta(days=int(d))).strftime("%d %b %Y")
+            if pd.notna(d) else "-"
+        )
+        urgent = urgent.sort_values(["stock_status", "total_drr"], ascending=[True, False])
+        show = urgent[["sku_name", "total_drr", "current_soh", "Need Delivery By", "stock_status"]].rename(
+            columns={"sku_name": "SKU Name", "total_drr": "Total DRR", "current_soh": "Current SOH",
+                     "stock_status": "Stock Status"}
+        )
 
-            def highlight(df):
-                def f(row):
-                    bg = "#FFC7CE" if row["Stock Status"] == "Stressed" else "#FFEB9C"
-                    fg = "#9C0006" if row["Stock Status"] == "Stressed" else "#9C6500"
-                    return [f"background-color:{bg}; color:{fg}"] * len(row)
-                return df.style.apply(f, axis=1)
+        def highlight(df):
+            def f(row):
+                bg = "#FFC7CE" if row["Stock Status"] == "Stressed" else "#FFEB9C"
+                fg = "#9C0006" if row["Stock Status"] == "Stressed" else "#9C6500"
+                return [f"background-color:{bg}; color:{fg}"] * len(row)
+            return df.style.apply(f, axis=1)
 
-            st.caption("'Need Delivery By' = the date stock is projected to run out at current sales pace.")
-            st.dataframe(highlight(show), use_container_width=True, hide_index=True)
+        st.caption("'Need Delivery By' = the date stock is projected to run out at current sales pace.")
+        st.dataframe(highlight(show), use_container_width=True, hide_index=True)
 
 if is_admin:
     with t_log:
         st.subheader("Activity Log")
         st.caption("Visible to admin only.")
-        log_entries = load_json(ACTIVITY_LOG_PATH, [])
+        log_entries = load_log()
         if not log_entries:
             st.info("No activity yet.")
         else:
-            log_df = pd.DataFrame(log_entries[::-1])
-            st.dataframe(log_df, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(log_entries)[["time", "user", "action"]], use_container_width=True, hide_index=True)
 
     with t_users:
         st.subheader("Manage Users")
-        users = load_json(USERS_PATH, {})
+        users = load_users()
 
         st.write("**Existing accounts:**")
         if users:
@@ -511,8 +637,7 @@ if is_admin:
             elif new_u.lower().strip() in users:
                 st.error("That username already exists.")
             else:
-                create_user(users, new_u, new_p, new_role)
-                save_json(USERS_PATH, users)
+                save_user(new_u, create_user_entry(new_p, new_role))
                 log_action(f"Created account for '{new_u.strip()}' ({new_role})")
                 st.success(f"Account created for {new_u.strip()}.")
                 st.rerun()
@@ -524,8 +649,7 @@ if is_admin:
             rcol1, rcol2 = st.columns([2, 1])
             to_remove = rcol1.selectbox("Username", removable, key="remove_user_select")
             if rcol2.button("Remove", use_container_width=True):
-                del users[to_remove]
-                save_json(USERS_PATH, users)
+                delete_user(to_remove)
                 log_action(f"Removed account '{to_remove}'")
                 st.success(f"Removed {to_remove}.")
                 st.rerun()
