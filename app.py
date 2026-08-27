@@ -302,8 +302,12 @@ def find_and_remove_ghost_duplicates():
         if binned_entries and non_binned_entries:
             to_delete.extend([rid for rid, _ in non_binned_entries])
 
-    for rid in to_delete:
-        delete_row(rid)
+    if to_delete:
+        db = get_db()
+        batch = db.batch()
+        for rid in to_delete:
+            batch.delete(db.collection("po_state").document(rid))
+        firestore_call(batch.commit)
     return to_delete
 
 
@@ -324,6 +328,51 @@ def sync_snapshot(rid, snapshot, existing):
         data.setdefault("reminders_sent", [])
     save_row(rid, data)
     return data
+
+
+def merge_snapshot_data(snapshot, existing):
+    """Same field-merging logic as sync_snapshot, without writing - used by
+    the batched upload path so all writes can go out together instead of
+    one Firestore round-trip per row."""
+    data = dict(snapshot)
+    if existing:
+        for k in ("status", "received", "binned", "revised_date", "reason", "reminders_sent"):
+            if k in existing:
+                data[k] = existing[k]
+    else:
+        data.setdefault("status", "Delayed" if snapshot.get("pipeline_delayed") else "On Time")
+        data.setdefault("received", False)
+        data.setdefault("binned", False)
+        data.setdefault("revised_date", None)
+        data.setdefault("reason", None)
+        data.setdefault("reminders_sent", [])
+    return data
+
+
+def sync_snapshots_batch(items):
+    """items: list of (rid, snapshot, existing) tuples. Writes all of them
+    using Firestore's WriteBatch - a handful of network round-trips instead
+    of one per row, which is what was making re-upload slow (78 PO lines
+    meant 78 sequential writes before this)."""
+    db = get_db()
+    BATCH_LIMIT = 400  # stay safely under Firestore's hard 500-write batch cap
+    batch = db.batch()
+    pending = 0
+
+    def commit():
+        nonlocal batch, pending
+        if pending:
+            firestore_call(batch.commit)
+            batch = db.batch()
+            pending = 0
+
+    for rid, snapshot, existing in items:
+        data = merge_snapshot_data(snapshot, existing)
+        batch.set(db.collection("po_state").document(rid), data, merge=True)
+        pending += 1
+        if pending >= BATCH_LIMIT:
+            commit()
+    commit()
 
 
 # ---------------------------------------------------------------------------
@@ -460,8 +509,8 @@ if is_admin:
 
         po_master_raw = po_master_raw.reset_index(drop=True)
         existing_state = load_state()
-        synced = 0
         key_counts = {}
+        items_to_sync = []
         for i, row in po_master_raw.iterrows():
             # Stable ID built from the PO's own business fields, NOT row position -
             # position shifts on every upload (rows get removed as they're received,
@@ -492,8 +541,11 @@ if is_admin:
                 "stock_status": sh.get("Stock Status", "No DRR Data"),
                 "pipeline_delayed": row.get("Delivery Status") == "Delayed",
             }
-            sync_snapshot(rid, snapshot, existing_state.get(rid))
-            synced += 1
+            items_to_sync.append((rid, snapshot, existing_state.get(rid)))
+
+        with st.spinner(f"Syncing {len(items_to_sync)} PO lines..."):
+            sync_snapshots_batch(items_to_sync)
+        synced = len(items_to_sync)
         log_action(f"Uploaded new tracker data ({synced} PO lines synced)")
         st.success(f"Uploaded - synced {synced} PO lines. This is now what everyone sees.")
         st.rerun()
