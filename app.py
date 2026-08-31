@@ -460,7 +460,7 @@ def auth_gate():
             setup_pw = st.text_input("Setup Password", type="password")
             new_username = st.text_input("Choose a Username")
             new_password = st.text_input("Choose a Password", type="password")
-            if st.button("Create Admin Account", use_container_width=True):
+            if st.button("Create Admin Account", width='stretch'):
                 if not setup_pw_secret:
                     st.error("No setup_password configured in Secrets - add one before continuing.")
                 elif setup_pw != setup_pw_secret:
@@ -478,7 +478,7 @@ def auth_gate():
         st.subheader("Login")
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
-        if st.button("Login", use_container_width=True):
+        if st.button("Login", width='stretch'):
             role = verify_user(users, username, password)
             if role:
                 st.session_state["username"] = username.strip()
@@ -552,12 +552,17 @@ if is_admin:
                 st.info("No duplicates found - nothing to clean up.")
             st.rerun()
     if uploaded is not None:
+        import time as _time
+        _t0 = _time.time()
+
         try:
             po_master_raw = pd.read_excel(uploaded, sheet_name="PO Master")
             stock_health_raw = pd.read_excel(uploaded, sheet_name="SKU Stock Health")
         except Exception as e:
             st.error(f"Couldn't read this file - is it the right output from run_stock_tracker.py? ({e})")
             st.stop()
+        _t1 = _time.time()
+        print(f"[upload timing] read Excel file: {_t1 - _t0:.2f}s")
 
         po_master_raw = po_master_raw.dropna(subset=["Item Code"]) if "Item Code" in po_master_raw.columns else po_master_raw
         stock_health_raw = stock_health_raw.dropna(subset=["Item Code"]) if "Item Code" in stock_health_raw.columns else stock_health_raw
@@ -576,7 +581,12 @@ if is_admin:
             st.warning(f"Found and removed {before_dedup - len(po_master_raw)} exact duplicate PO+SKU line(s) in the uploaded file.")
 
         po_master_raw = po_master_raw.reset_index(drop=True)
+
+        _t2 = _time.time()
         existing_state = load_state()
+        _t3 = _time.time()
+        print(f"[upload timing] load_state() (existing marks, {len(existing_state)} docs): {_t3 - _t2:.2f}s")
+
         key_counts = {}
         items_to_sync = []
         for i, row in po_master_raw.iterrows():
@@ -611,11 +621,21 @@ if is_admin:
             }
             items_to_sync.append((rid, snapshot, existing_state.get(rid)))
 
+        _t4 = _time.time()
+        print(f"[upload timing] build {len(items_to_sync)} snapshot dicts (local, no network): {_t4 - _t3:.2f}s")
+
         with st.spinner(f"Syncing {len(items_to_sync)} PO lines..."):
             sync_snapshots_batch(items_to_sync)
+        _t5 = _time.time()
+        print(f"[upload timing] sync_snapshots_batch write: {_t5 - _t4:.2f}s")
+
         invalidate_cache("_cache_state")  # bulk change - worth one fresh read, unlike single-row actions
         synced = len(items_to_sync)
         log_action(f"Uploaded new tracker data ({synced} PO lines synced)")
+        _t6 = _time.time()
+        print(f"[upload timing] log_action write: {_t6 - _t5:.2f}s")
+        print(f"[upload timing] TOTAL: {_t6 - _t0:.2f}s")
+
         st.success(f"Uploaded - synced {synced} PO lines. This is now what everyone sees.")
         st.rerun()
 
@@ -647,7 +667,7 @@ def _clear_sku_search():
 
 sku_search = fcol2.text_input("🔍 Search SKU Code", placeholder="e.g. RMSH200", key="sku_search")
 fcol3.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)  # align button with the input box
-fcol3.button("✕ Clear", disabled=not sku_search, use_container_width=True, on_click=_clear_sku_search)
+fcol3.button("✕ Clear", disabled=not sku_search, width='stretch', on_click=_clear_sku_search)
 
 # If the filter selection changed since last run, drop any list-selection
 # state - otherwise a previously-selected ROW POSITION could silently point
@@ -698,14 +718,14 @@ def render_row_body(row, show_delay_controls):
         return
 
     if rstate["status"] == "On Time":
-        if st.button("🔴 Mark Delayed", key=f"toggle_{rid}", use_container_width=True):
+        if st.button("🔴 Mark Delayed", key=f"toggle_{rid}", width='stretch'):
             shared_state[rid]["status"] = "Delayed"
             save_row(rid, {"status": "Delayed"})
             log_action(f"Marked {po_no} / {item_code} as Delayed")
             st.session_state.setdefault("dirty_rids", set()).add(rid)
             st.rerun()
     else:
-        if st.button("🟢 Mark On Time", key=f"toggle_{rid}", use_container_width=True):
+        if st.button("🟢 Mark On Time", key=f"toggle_{rid}", width='stretch'):
             shared_state[rid]["status"] = "On Time"
             save_row(rid, {"status": "On Time"})
             log_action(f"Marked {po_no} / {item_code} as On Time")
@@ -715,13 +735,13 @@ def render_row_body(row, show_delay_controls):
     if is_admin:
         acol1, acol2 = st.columns(2)
         recv_label = "✅ Received" if rstate["received"] else "📥 Received"
-        if acol1.button(recv_label, key=f"recv_{rid}", use_container_width=True):
+        if acol1.button(recv_label, key=f"recv_{rid}", width='stretch'):
             new_val = not rstate["received"]
             shared_state[rid]["received"] = new_val
             save_row(rid, {"received": new_val})
             log_action(f"{'Marked' if new_val else 'Unmarked'} {po_no} / {item_code} as Received")
             st.rerun()
-        if acol2.button("🗑️ Bin", key=f"bin_{rid}", use_container_width=True):
+        if acol2.button("🗑️ Bin", key=f"bin_{rid}", width='stretch'):
             shared_state[rid]["binned"] = True
             save_row(rid, {"binned": True})
             log_action(f"Binned {po_no} / {item_code}")
@@ -805,7 +825,7 @@ def render_master_detail(df, list_key):
     st.caption("Click any row to view and act on it below.")
     event = st.dataframe(
         list_df.drop(columns=["_rid"]),
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         height=min(38 * (len(list_df) + 1) + 3, 420),
         on_select="rerun",
@@ -859,7 +879,7 @@ with t_delayed:
         all_dirty = st.session_state.get("dirty_rids", set())
         scol1, scol2 = st.columns([1, 3])
         if scol1.button(f"📤 Submit Updates ({len(all_dirty)})", disabled=len(all_dirty) == 0,
-                         type="primary", use_container_width=True):
+                         type="primary", width='stretch'):
             dirty_items = [dict(shared_state[r], _rid=r) for r in all_dirty if r in shared_state]
             n = submit_updates(dirty_items, ADMIN_EMAIL, MADRI_EMAIL, PRATHAM_EMAIL, current_user)
             log_action(f"Submitted {n} delivery update(s) - notified admin/Pratham/Madri as applicable")
@@ -933,7 +953,7 @@ with t_stock:
             return df.style.apply(f, axis=1)
 
         st.caption("'Need Delivery By' = the date stock is projected to run out at current sales pace.")
-        st.dataframe(highlight(show), use_container_width=True, hide_index=True)
+        st.dataframe(highlight(show), width='stretch', hide_index=True)
 
 if is_admin:
     with t_log:
@@ -943,7 +963,7 @@ if is_admin:
         if not log_entries:
             st.info("No activity yet.")
         else:
-            st.dataframe(pd.DataFrame(log_entries)[["time", "user", "action"]], use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(log_entries)[["time", "user", "action"]], width='stretch', hide_index=True)
 
     with t_users:
         st.subheader("Manage Users")
@@ -952,7 +972,7 @@ if is_admin:
         st.write("**Existing accounts:**")
         if users:
             user_rows = [{"Username": u, "Role": info["role"]} for u, info in users.items()]
-            st.dataframe(pd.DataFrame(user_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(user_rows), width='stretch', hide_index=True)
         else:
             st.info("No accounts yet.")
 
@@ -962,7 +982,7 @@ if is_admin:
         new_u = ucol1.text_input("Username", key="newuser_name")
         new_p = ucol2.text_input("Password", type="password", key="newuser_pw")
         new_role = ucol3.selectbox("Role", ["viewer", "editor", "admin"], key="newuser_role")
-        if ucol4.button("Add", use_container_width=True):
+        if ucol4.button("Add", width='stretch'):
             if not new_u.strip() or not new_p:
                 st.error("Enter both a username and password.")
             elif new_u.lower().strip() in users:
@@ -979,7 +999,7 @@ if is_admin:
         if removable:
             rcol1, rcol2 = st.columns([2, 1])
             to_remove = rcol1.selectbox("Username", removable, key="remove_user_select")
-            if rcol2.button("Remove", use_container_width=True):
+            if rcol2.button("Remove", width='stretch'):
                 delete_user(to_remove)
                 log_action(f"Removed account '{to_remove}'")
                 st.success(f"Removed {to_remove}.")
