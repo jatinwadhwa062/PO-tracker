@@ -589,6 +589,7 @@ if is_admin:
 
         key_counts = {}
         items_to_sync = []
+        total_rows = len(po_master_raw)
         for i, row in po_master_raw.iterrows():
             # Stable ID built from the PO's own business fields, NOT row position -
             # position shifts on every upload (rows get removed as they're received,
@@ -619,24 +620,33 @@ if is_admin:
                 "stock_status": sh.get("Stock Status", "No DRR Data"),
                 "pipeline_delayed": row.get("Delivery Status") == "Delayed",
             }
-            items_to_sync.append((rid, snapshot, existing_state.get(rid)))
+            existing = existing_state.get(rid)
+            # Skip the write entirely if nothing about this row actually changed
+            # since last upload - most SKUs don't move day to day, only the ones
+            # with new POs or fresh stock received do. Writing all ~78 rows every
+            # single day regardless was burning through Firestore's write quota
+            # for dozens of documents that were already correct.
+            if existing == merge_snapshot_data(snapshot, existing):
+                continue
+            items_to_sync.append((rid, snapshot, existing))
 
         _t4 = _time.time()
-        print(f"[upload timing] build {len(items_to_sync)} snapshot dicts (local, no network): {_t4 - _t3:.2f}s")
+        print(f"[upload timing] build snapshot dicts, {len(items_to_sync)} changed (local, no network): {_t4 - _t3:.2f}s")
 
-        with st.spinner(f"Syncing {len(items_to_sync)} PO lines..."):
+        with st.spinner(f"Syncing {len(items_to_sync)} changed PO line(s)..."):
             sync_snapshots_batch(items_to_sync)
         _t5 = _time.time()
         print(f"[upload timing] sync_snapshots_batch write: {_t5 - _t4:.2f}s")
 
         invalidate_cache("_cache_state")  # bulk change - worth one fresh read, unlike single-row actions
         synced = len(items_to_sync)
-        log_action(f"Uploaded new tracker data ({synced} PO lines synced)")
+        unchanged = total_rows - synced
+        log_action(f"Uploaded new tracker data ({synced} changed, {unchanged} unchanged and skipped, {total_rows} total)")
         _t6 = _time.time()
         print(f"[upload timing] log_action write: {_t6 - _t5:.2f}s")
         print(f"[upload timing] TOTAL: {_t6 - _t0:.2f}s")
 
-        st.success(f"Uploaded - synced {synced} PO lines. This is now what everyone sees.")
+        st.success(f"Uploaded - {synced} line(s) changed and synced, {unchanged} unchanged (skipped to save quota). This is now what everyone sees.")
         st.rerun()
 
 shared_state = load_state()
